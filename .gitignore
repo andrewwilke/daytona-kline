@@ -1,0 +1,20 @@
+# Dependencies (package-lock.json stays tracked)
+node_modules/
+
+# Local state, written by the tool on your machine
+config.json
+logs/
+*.csv
+
+# Your own ECU unlock number: never commit or share (unlock.example.json is the tracked placeholder)
+unlock.json
+
+# Editor and OS junk
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+.claude/settings.local.json

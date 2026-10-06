@@ -1,0 +1,4 @@
+{
+  "_comment": "Placeholder. Copy this file to unlock.json and replace 0 with your own value (a whole number from 1 to 65535). 0 is rejected as invalid by the tool. unlock.json is git-ignored: never share it.",
+  "multiplier": 0
+}

@@ -1,0 +1,4 @@
+# Line endings: stored as LF, checked out per platform; the Windows launcher stays CRLF and the shell one LF.
+* text=auto
+*.bat text eol=crlf
+*.sh text eol=lf
