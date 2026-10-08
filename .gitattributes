@@ -1,4 +1,5 @@
-# Line endings: stored as LF, checked out per platform; the Windows launcher stays CRLF and the shell one LF.
+# Line endings: text files are stored as LF and checked out per platform; the shell launcher is always LF.
 * text=auto
-*.bat text eol=crlf
+# The Windows launcher is stored with its CRLF endings as they are, so a downloaded zip (which does no conversion) has them too.
+*.bat -text
 *.sh text eol=lf
