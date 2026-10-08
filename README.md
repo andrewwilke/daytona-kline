@@ -1,41 +1,46 @@
 # daytona-kline
 
-Read-only diagnostic tool for the **Triumph Daytona 675 (2006–2012, Keihin ECU)**, talking
-over the K-line through a TuneECU-style FTDI USB-to-OBD cable: ISO 9141-2 OBD-II after a slow
-init (what a 2012 Daytona 675 answers), or KWP2000 (ISO 14230) after a fast init (the other
-ECUs of the family; the tool tries both).
+**Free, open-source diagnostic software for the Triumph Daytona 675 (2006-2012, Keihin ECU).**
+Live dials, graphs, a fuel map, fault codes and session recording, in your browser, over the same
+cheap FTDI USB-to-OBD cable that TuneECU uses. No account, no cloud: it all runs on your computer.
 
-What it does: find and connect to the ECU, show live engine data (rpm, speed, throttle,
-manifold pressure, temperatures, load, timing, fuel trim, fuel system status) on the screen
-and in a CSV, and read and clear fault codes together with the warning light (MIL) state.
-All of it is standard OBD-II (SAE J1979 modes 01, 03 and 04), which the 2012 Daytona serves
-without any security unlock. With the ECU unlocked (optional, below) it also shows the switch
-states by name, records everything together with time stamps and events to catch a bike that
-starts and then dies, and searches the ECU for more ids (see "Switches, Record and Find more IDs").
+![The dashboard](docs/images/dashboard-demo.png)
 
-What it deliberately does **not** do: write anything to the ECU. No map flashing, no
-table edits. The only things that change ECU state or drive anything are `cleardtc`, which asks
-for `--yes`, and the optional, opt-in output tests (see "Output tests (optional)"), a whitelist
-of 8 short tests that make the bike move or run parts and need the ECU unlock.
+*Screenshots in this README come from a simulated ECU, not from a real bike's data.*
 
-## Read this first: safety and no warranty
+### [Download for Windows](https://github.com/andrewwilke/daytona-kline/releases/latest) (portable zip: unzip, double-click `start.bat`, nothing to install)
 
-This is a hobby project made by an owner for their own bike, shared in the hope it helps others.
-It comes with **no warranty of any kind** (see the licence): use it at your own risk.
+Mac and Linux: install [Node.js](https://nodejs.org), then see [Quick start](#quick-start).
 
-- It talks to your bike's ECU over the diagnostic port. Mostly it only **reads**. The three things
-  that change anything are clearing stored fault codes (asks for confirmation), the optional ECU
-  unlock, and the optional output tests, which make the bike move or run parts (the tach needle,
-  the cooling fan, the fuel pump and so on). Read "Output tests" before using them, and only run
-  them with the bike stationary, the engine off and your hands clear of the fan and exhaust valve.
-- It has been tried on **one bike**, a 2012 Triumph Daytona 675 (Keihin ECU), with one cable. Other
-  years, models and cables may behave differently or not work at all.
-- A weak battery and a diagnostic session do not mix: use a battery tender for long sessions.
-- The ECU unlock needs a number for your own ECU that this project does not supply and will not
-  help you obtain. Without it you still get the dials, fault codes and recordings.
-- Do not use it while riding. Do not use it to defeat emissions or safety systems.
-- Not affiliated with or endorsed by Triumph, Keihin or the makers of TuneECU or any other tool;
-  those are names of their owners.
+> **Use at your own risk, no warranty.** Mostly it only reads from the ECU, but the optional output
+> tests make parts of the bike move. It has been tried on one bike, a 2012 Daytona 675, with one cable.
+> Please read [Read this first](#read-this-first-safety-and-no-warranty) before connecting.
+
+## What it does
+
+- **Dashboard:** rpm, speed (mph), throttle, manifold pressure, coolant and intake temperature, load,
+  timing and fuel trim as dials, plus a strip of the numbers that matter on every tab.
+- **Graphs and a fuel map:** live strip charts, and an rpm-against-throttle (or manifold pressure) map
+  coloured by injection pulse, with a crosshair where the engine is now. Saved recordings open as graphs.
+- **Fault codes:** read them with the warning light state, and clear them (it asks first).
+- **Recording:** one file with time stamps, your notes and automatic events, to catch a bike that starts and
+  then dies. The author found their own no-start this way: it was the tip-over sensor.
+- **With the ECU unlock (optional, you supply the number for your own ECU):** the clutch, neutral, sidestand,
+  tip-over, start and fuel pump switches by name, battery and gear, and the optional output tests.
+- **Also:** a command-line version of everything above, and it is read-only apart from clearing codes,
+  the unlock and the output tests (see below). No flashing, no map writing, ever.
+
+![Graphs and the fuel map](docs/images/graphs-demo.png)
+
+*Live graphs and the fuel map filling in as the engine runs (simulated ECU).*
+
+## Contents
+
+[What works today](#what-works-today) · [Quick start](#quick-start) · [Read this first](#read-this-first-safety-and-no-warranty) ·
+[Connecting to the bike](#connecting-to-the-bike) · [Everyday commands](#everyday-commands) ·
+[Unlocking the ECU](#unlocking-the-ecu-optional) · [Switches, Record and Find more IDs](#switches-record-and-find-more-ids) ·
+[Output tests](#output-tests-optional) · [If the ECU won't answer](#if-the-ecu-wont-answer) · [How it works](#how-it-works-for-the-curious) ·
+[Licence](#licence)
 
 ## What works today
 
@@ -50,11 +55,17 @@ It comes with **no warranty of any kind** (see the licence): use it at your own 
 
 ## Quick start
 
-You need three things: a **TuneECU-style FTDI USB-to-OBD cable**, a computer with
-**[Node.js](https://nodejs.org) 18 or newer**, and the bike (ignition on, kill switch at run).
+You need a **TuneECU-style FTDI USB-to-OBD cable**, a computer, and the bike (ignition on, kill
+switch at run).
 
-1. Download or clone this folder.
-2. Start it:
+**Windows, easiest:** download the portable zip from the
+[latest release](https://github.com/andrewwilke/daytona-kline/releases/latest), unzip it anywhere and
+double-click `start.bat`. It carries its own Node.js, so nothing else is installed.
+
+**From the source (any system):** install [Node.js](https://nodejs.org) 18 or newer, get this folder
+(clone it or download the zip), then:
+
+1. Start it:
    - **Windows:** double-click `start.bat`.
    - **Mac / Linux:** run `sh start.sh`.
    - Or in a terminal: `npm install` once, then `npm start`.
@@ -63,7 +74,7 @@ You need three things: a **TuneECU-style FTDI USB-to-OBD cable**, a computer wit
    starts in seconds and opens the page at http://localhost:3675.
    (A recent npm may print a warning that it skipped an install script of the serial-port
    library. That is fine: the library ships ready-made binaries for Windows, macOS and Linux.)
-3. Plug the cable into the bike's diagnostic connector (under the seat) and into USB, pick its
+2. Plug the cable into the bike's diagnostic connector (under the seat) and into USB, pick its
    port at the top of the page and press **Connect**. The ECU answers only about one try in three,
    so connecting can take up to a minute. After that the dashboard and the switch watcher run by
    themselves.
@@ -87,6 +98,25 @@ pump and the tip-over sensor) stays on screen on every tab.
 ```bash
 npm install
 ```
+
+## Read this first: safety and no warranty
+
+This is a hobby project made by an owner for their own bike, shared in the hope it helps others.
+It comes with **no warranty of any kind** (see the licence): use it at your own risk.
+
+- It talks to your bike's ECU over the diagnostic port. Mostly it only **reads**. The three things
+  that change anything are clearing stored fault codes (asks for confirmation), the optional ECU
+  unlock, and the optional output tests, which make the bike move or run parts (the tach needle,
+  the cooling fan, the fuel pump and so on). Read "Output tests" before using them, and only run
+  them with the bike stationary, the engine off and your hands clear of the fan and exhaust valve.
+- It has been tried on **one bike**, a 2012 Triumph Daytona 675 (Keihin ECU), with one cable. Other
+  years, models and cables may behave differently or not work at all.
+- A weak battery and a diagnostic session do not mix: use a battery tender for long sessions.
+- The ECU unlock needs a number for your own ECU that this project does not supply and will not
+  help you obtain. Without it you still get the dials, fault codes and recordings.
+- Do not use it while riding. Do not use it to defeat emissions or safety systems.
+- Not affiliated with or endorsed by Triumph, Keihin or the makers of TuneECU or any other tool;
+  those are names of their owners.
 
 ## Connecting to the bike
 
