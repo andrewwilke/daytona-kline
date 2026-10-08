@@ -18,6 +18,36 @@ table edits. The only things that change ECU state or drive anything are `cleard
 for `--yes`, and the optional, opt-in output tests (see "Output tests (optional)"), a whitelist
 of 8 short tests that make the bike move or run parts and need the ECU unlock.
 
+## Read this first: safety and no warranty
+
+This is a hobby project made by an owner for their own bike, shared in the hope it helps others.
+It comes with **no warranty of any kind** (see the licence): use it at your own risk.
+
+- It talks to your bike's ECU over the diagnostic port. Mostly it only **reads**. The three things
+  that change anything are clearing stored fault codes (asks for confirmation), the optional ECU
+  unlock, and the optional output tests, which make the bike move or run parts (the tach needle,
+  the cooling fan, the fuel pump and so on). Read "Output tests" before using them, and only run
+  them with the bike stationary, the engine off and your hands clear of the fan and exhaust valve.
+- It has been tried on **one bike**, a 2012 Triumph Daytona 675 (Keihin ECU), with one cable. Other
+  years, models and cables may behave differently or not work at all.
+- A weak battery and a diagnostic session do not mix: use a battery tender for long sessions.
+- The ECU unlock needs a number for your own ECU that this project does not supply and will not
+  help you obtain. Without it you still get the dials, fault codes and recordings.
+- Do not use it while riding. Do not use it to defeat emissions or safety systems.
+- Not affiliated with or endorsed by Triumph, Keihin or the makers of TuneECU or any other tool;
+  those are names of their owners.
+
+## What works today
+
+| | Status |
+|---|---|
+| Connect (slow init), OBD dials, fault codes and the warning light, clearing codes | tried on the bike |
+| ECU unlock (with your own number), named switches, the tip-over sensor | tried on the bike |
+| Recorder with events and notes, graphs, fuel map | tried on the bike, the graphs and map only briefly |
+| Output tests | 5 of the 8 tried on the bike; the other 3 are probably parts missing from that bike |
+| Sensor block, probe, live and watch commands, Find more IDs | not working on the tested bike (its ECU never answers service 0x21), kept for other ECUs |
+| Anything on a model other than the 2012 Daytona 675 | untested |
+
 ## Quick start
 
 You need three things: a **TuneECU-style FTDI USB-to-OBD cable**, a computer with
@@ -795,3 +825,12 @@ run one while the GUI or the CLI holds the port.
   the same interfaces the page uses. It can inject faults
   (dropped reply, corrupted checksum, partial echo, wrong service), and the tests use a clock
   that never sleeps.
+
+## Licence
+
+Copyright (C) 2026 Andrew Wilke. This program is free software: you can redistribute it and/or
+modify it under the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later version. It is
+distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied
+warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file `LICENSE` for the
+full text.

@@ -110,3 +110,7 @@ Everything specific to one bike lives in one description file in `src/bikes/`.
    `src/bikes/index.js` and do not put bike specifics in the generic modules.
 
 Do not include anything in a description that needs a secret to use.
+
+## Licence
+
+By contributing you agree that your work is released under the project's licence (GPL-3.0-or-later, see `LICENSE`).
