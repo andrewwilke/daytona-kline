@@ -61,6 +61,8 @@ You need three things: a **TuneECU-style FTDI USB-to-OBD cable**, a computer wit
 
    The first start installs what it needs (about a minute, needs internet once); after that it
    starts in seconds and opens the page at http://localhost:3675.
+   (A recent npm may print a warning that it skipped an install script of the serial-port
+   library. That is fine: the library ships ready-made binaries for Windows, macOS and Linux.)
 3. Plug the cable into the bike's diagnostic connector (under the seat) and into USB, pick its
    port at the top of the page and press **Connect**. The ECU answers only about one try in three,
    so connecting can take up to a minute. After that the dashboard and the switch watcher run by
