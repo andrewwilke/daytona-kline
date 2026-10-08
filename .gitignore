@@ -31,3 +31,6 @@ desktop.ini
 *.sync-conflict-*
 *.log
 npm-debug.log*
+
+# Output of scripts/build-portable.js
+dist/
