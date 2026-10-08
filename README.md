@@ -312,7 +312,8 @@ on the next sample's `marker` column, and a note made after the last sample gets
 The panel also shows the lowest and highest battery voltage seen, the elapsed time and the CSV file
 name. A recording stops by itself after 10 minutes (`--minutes`), when the file would pass 50 MB
 (with a message), when you stop it, or when the connection ends; the file is always closed.
-The dashboard pauses while recording (one run at a time on the K-line).
+The dashboard and the switch watcher pause while recording (one run at a time on the K-line) and
+come back when it ends.
 
 To catch a bike that **starts and then dies**: connect, start recording with the key on, press
 **Cranking** as you thumb the starter, **Started** when it fires and **Died** when it quits. Then open
@@ -625,6 +626,16 @@ run one while the GUI or the CLI holds the port.
   `echo-mismatch`, `negative-response` (with `service` and `code`) or `wrong-service`.
   Link failures are resent once unless the request is declared `destructive` (clear DTCs),
   which is never resent.
+- **The line lock** (`LineLock` in `src/kwp.js`, behind every session): one request on the K-line at a
+  time, in a fixed order. `session.request(data, opts)` takes the line and gives it back in a
+  `finally`, success or failure; the line passes straight to the next waiting request, so a late one
+  cannot cut in. Two priorities (`PRIORITY.NORMAL`, and `PRIORITY.BACKGROUND` for reads nobody is
+  watching move, `background: true`): when the line comes free the oldest background request that has
+  waited `setBackgroundWaitMs(ms)` (300 ms unless the run coordinator changed it) goes first, else the
+  oldest normal one. `session.hold()` returns `{ request, release }` for something that must not be
+  interleaved (the unlock's seed and key): requests already queued finish first, then only the
+  holder's requests go and everything else waits until `release()`. One hold at a time; always
+  release in a `finally`.
 - **Connection** (`src/connection.js`): the one place that turns a port name into a ready
   session: saved wake-up first, then the bike's order, then making the session ready and the
   keep-alive, `config.json` (which remembers the kind of wake-up that worked). An addressed
@@ -659,23 +670,73 @@ run one while the GUI or the CLI holds the port.
   an error) with the status, and `faultSummary` is the one line comparing the warning light
   and the ECU's count with the codes read. On an ISO 9141 session there is no KWP fallback:
   a refused mode 03 or 04 is an error, never a different service.
-- **Live runs** (`src/liverun.js`): one module owns what a run is. `gaugeRun` (the dashboard:
-  rpm, speed and throttle every cycle, one slower gauge per cycle in turn, requests at least
-  60 ms apart which is the session's job), `blockRun` (a sensor data block), `switchRun` and
-  `probeRun` poll over the connection's session at a pace and keep the latest sample, min/max
-  per channel, error counts and, for gauge and block runs, the CSV. The gauge run reads the
-  supported-PID list first: a gauge whose PID is not on it is marked `not available` without
-  being asked, one that is on it but never answers is marked after three cycles, and a marked
-  gauge is not polled again; a gauge that answered once is never dropped. A run is stopped with
-  `stop()` or by the connection ending; `gauges`, `watch`, `live`, `switches` and `probe` in
-  the CLI and the gauges, live, switches and probe endpoints of the GUI server only render
-  what a run reports. `src/recorder.js` (`recordRun`: gauges, switches and analog values
-  into one time-stamped CSV, with markers and events) and `src/discover.js` (`discoverRun`, the
-  0x22 sweep, and `takeSnapshot`) are runs too, registered with the connection like the rest.
-  `decodeSwitch(def, bytes)` in `src/services.js` is the one place that turns a switch id's bytes
-  into on / off. The GUI server's `/api/gauges` returns the dial definitions, the latest
-  values, the supported PIDs and the unavailable gauges; `/api/dtc` returns the codes, the
-  warning light status and the one-line summary.
+- **Live runs** (`src/liverun.js`): one module owns what a run is. `LiveRun` polls over the
+  connection's session at a pace and keeps the latest sample, min/max per channel, error counts, a
+  short history for the graphs (`series(since)`) and, if asked, a CSV; `gaugeRun` (the dashboard: rpm,
+  speed and throttle every cycle, one slower gauge per cycle in turn), `blockRun` (a sensor data
+  block), `switchRun` and `probeRun` are its kinds. A run is stopped with `stop()` or by the
+  connection ending (it registers with the connection when created). Read errors are counted and the
+  run carries on: whether the link is dead is the connection's call. `gauges`, `watch`, `live`,
+  `switches` and `probe` in the CLI and the matching endpoints of the GUI server only render what a
+  run reports. `src/recorder.js` (`recordRun`: gauges, switches and analog values into one
+  time-stamped CSV, with markers and events) and `src/discover.js` (`discoverRun`, the 0x22 sweep,
+  and `takeSnapshot`) are runs too.
+  - *Sample time.* A sample's time is when its cycle started, in ms since the run started, read once
+    by the run and handed to the sampler as `ctx.t`. The graph history, the run CSV's `time` column
+    and the recorder's `t_ms` all use that one value, so a live graph and the replay of its
+    recording put a sample at the same moment.
+  - *Log sink* (`src/logsink.js`): `openLogSink({ dir, prefix, stamp, maxBytes, onError })` is one
+    log file and nothing about what goes in it: it never overwrites (a numbered name if the file
+    exists), refuses rows past a size limit, closes itself if a write fails (reported once, never
+    thrown into the run) and is closed by the run when the run ends. `DEFAULT_LOG_DIR` (the project's
+    `logs` folder) and `logStamp(ms)` are defined there, once.
+  - *Polled-item set* (`src/pollset.js`): `pollset({ items, every, ... })` is the policy "an item
+    that never answered is dropped, one that answered keeps its last value (stale)" and the rotation
+    "one item per cycle in turn", written once for the dashboard, the switch watcher and the
+    recorder. It knows nothing about requests: each cycle `plan()` says what to read (and applies the
+    unlock gate and the supported-PID list), the run reads it its own way and `report()`s what came
+    back. The strike counts (3, 6, 2 ...) differ per caller on purpose and live in that file with
+    the reason for each. The gauge run reads the supported-PID list first, so a gauge whose PID is
+    not on it is marked `not available` without being asked.
+  - *Run coordinator* (`src/runs.js`, `createRuns(conn)`): the one place that decides who may use the
+    K-line. Every feature of the page is a run in one of three roles: `exclusive` (`recording`,
+    `scan`: they refuse each other and hold the line alone), `background` (`dashboard`, `switches`:
+    stopped for an exclusive run and started again when it ends, and held back, server-side, if the
+    page asks meanwhile, so a reloaded page cannot start them beside the recorder) and `tool`
+    (`sensor`, `probe`: started and stopped by the owner). `runs.start(name)`, `stop(name)`,
+    `ensure(name)`, `reconcile()` and `status()` are the interface: the owner's Stop of the
+    dashboard or the switch watcher is remembered until the next connection and nothing restarts it
+    behind the owner's back, and `reconcile()` starts what should be running (the dashboard, and the
+    switch watcher once unlocked) and is what the page calls once connected. The line priority
+    tuning (how long a waiting switch read may be overtaken by the dashboard, longer while the
+    engine runs) is there too. None of it can start anything the owner could not start before.
+  - *GUI server* (`server.js`): routes only, `'METHOD /path': async (body, query) => object`,
+    answered as `{ ok: true, ...object }` or `{ ok: false, error }`. Besides the routes the page
+    already used (`POST /api/gauges/start` answers `{ paused: true, note }` while a recording or
+    scan runs, and `GET /api/switches` answers its usual shape plus `paused: true` and a `note`), it
+    has `GET /api/runs` (read-only: what is running, what is paused and why, which features the
+    owner stopped, what waits for the unlock, which exclusive run is on), `POST /api/runs/start`
+    and `POST /api/runs/stop` (`{ "feature": "dashboard" | "switches" }`: the owner starting or
+    stopping it) and `POST /api/runs/reconcile`. `/api/gauges` returns the dial definitions, the
+    latest values, the supported PIDs and the unavailable gauges (and `series` when asked with
+    `?since=`); `/api/dtc` returns the codes, the warning light status and the one-line summary.
+    `decodeSwitch(def, bytes)` in `src/services.js` is the one place that turns a switch id's bytes
+    into on / off.
+- **The page** (`public/index.html`, `public/js/`): the server serves the page at `/` and the
+  scripts at `/js/<name>.js` and nothing else (a name is lower-case letters, digits and dashes and
+  must be a file of `public/js`: no dots, slashes or other ways out of the folder; everything else is
+  a 404). `app.js` is the drawing and DOM code; the logic without a DOM is in three plain scripts
+  loaded before it, each setting one global and also working with `require()` in Node so the tests
+  cross the same interface the page does: `graphstore.js` (`GraphStore`: the points the strip
+  charts, the vitals strip and the fuel map are drawn from, re-based onto the page's clock, with a
+  saved recording opened as a replay), `fuelmap.js` (`FuelMap`: the fuel map's cells, derived
+  metrics and crosshair) and `session.js` (`SessionState`: what should be running, decided from
+  `GET /api/runs`). The page keeps no flags of its own about who may use the K-line or what the
+  owner stopped: it asks the server and follows. The graph lanes are listed in `app.js`.
+- **Small shared modules**: `src/format.js` (hex text for ids and bytes), `src/clock.js` (the clock
+  that everything that waits goes through, so tests can swap in one that never sleeps, and
+  `waitUntil` for precise waits) and `src/recordings.js` (lists and reads the `record-*.csv` files
+  of the logs folder, and only those, for the page's Saved recordings).
 - **Bike knowledge** (`src/bikes/`): everything specific to one bike lives in one
   description file, `triumph-keihin-2006-2012.js`: the ECU and tester addresses and the
   order to try them in, the diagnostic session, the data block id and sensor block field
@@ -695,12 +756,16 @@ run one while the GUI or the CLI holds the port.
 - **Probe kit** (`src/probekit.js`): what the scripts in `scripts/` share: capture window,
   busy-wait timing, power/echo check, frame building, echo stripping, raw pulses, and the
   wake-ups. `wake()` is the tool's own wake-up (fast or slow, a slow one with retries) so a
-  silent probe predicts a silent `scan`. The raw slow-init pieces use the same bit-banging as
-  the tool (`src/wakeup.js`): `slowInit()` sends the address (bit time, edge timing and parity
-  are options) and returns the moment KB2 has arrived, `ackKb2()` sends `~KB2` 28 ms after the
-  call (the ECU ignores one sent after about 50 ms), and `slowHandshake()` runs the whole
-  exchange with the tool's retry spacing and reports where it stopped.
-  Scripts only use the transport's interface; `npm test` runs the kit against the mock.
+  silent probe predicts a silent `scan`. It reuses the tool's pieces wherever the behaviour is the
+  same: the frame checksum and `buildFrame` are `checksum` and `addressedFrame` of `src/kwp.js`,
+  and the 5-baud bit-banging, the key byte listener and the `~KB2` acknowledgement are
+  `src/wakeup.js`'s. What deliberately differs stays here: the Honda-style two's-complement
+  checksum (`withChecksum`), and `slowInit()`, which only sends the address and listens (bit time,
+  edge timing and parity are options) and returns the moment KB2 has arrived, where the tool's slow
+  init also waits for idle and acknowledges. `ackKb2()` sends `~KB2` 28 ms after the call (the ECU
+  ignores one sent after about 50 ms) and `slowHandshake()` runs the whole exchange with the tool's
+  retry spacing and reports where it stopped. Scripts only use the transport's interface; `npm test`
+  runs the kit against the mock.
 - **Services used**: mode 01 live data (the PIDs above), mode 03 stored codes, mode 04 clear
   codes (only behind `--yes` or the page's confirmation), mode 07 pending codes when served;
   on addressed (KWP2000) sessions also StartCommunication (81), StartDiagnosticSession (10),
@@ -726,6 +791,7 @@ run one while the GUI or the CLI holds the port.
   `t.routinesStopped`) and flip id `0x60` for a few seconds on the pump routine; `outputTestsSilent` and
   `outputTestsRefuse` are its faults.
   `test/cli.test.js` and `test/cli-record.test.js` run the CLI commands against it and check
-  what they print. It can inject faults
+  what they print. The page's modules (`test/page-*.test.js`) and the server's static files are tested through
+  the same interfaces the page uses. It can inject faults
   (dropped reply, corrupted checksum, partial echo, wrong service), and the tests use a clock
   that never sleeps.

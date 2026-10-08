@@ -15,9 +15,9 @@
  */
 
 const { realClock, waitUntil } = require('./clock');
-const { hex: kwpHex } = require('./kwp');
+const { hex: kwpHex, checksum, addressedFrame } = require('./kwp');
 const {
-  tryWakeUp, addressBits, bitBang, listenForKeyBytes,
+  tryWakeUp, addressBits, bitBang, listenForKeyBytes, acknowledgeKb2,
   SETTLE_MS, SLOW_BIT_MS, SLOW_IDLE_MS, SLOW_RETRY_MS, SLOW_ACK_MS,
 } = require('./wakeup');
 
@@ -38,16 +38,17 @@ const preciseClock = {
 
 const hex = (bytes) => (bytes.length ? kwpHex(bytes) : '(nothing)');
 
-const checksum = (bytes) => bytes.reduce((a, b) => (a + b) & 0xff, 0);
-
-/** Append a checksum: the sum of the bytes (KWP2000), or its two's complement (Honda style). */
+/**
+ * Append a checksum: the sum of the bytes (KWP2000, the tool's own, from src/kwp.js), or its two's
+ * complement (Honda style, which only a probe ever sends: the tool has no use for it).
+ */
 const withChecksum = (body, { twosComplement = false } = {}) => [
   ...body,
   twosComplement ? (0x100 - checksum(body)) & 0xff : checksum(body),
 ];
 
-/** A KWP frame with address bytes; `fmt` is the 0x80/0xC0 base, the data length is OR-ed in. */
-const buildFrame = (fmt, target, source, data) => withChecksum([fmt | data.length, target, source, ...data]);
+/** A KWP frame with address bytes, built as the session builds its own (`fmt` is the 0x80/0xC0 base). */
+const buildFrame = addressedFrame;
 
 /** Bytes waiting right now. */
 async function drain(t) {
@@ -225,6 +226,8 @@ async function breakPulse(t, { idleMs = 400, lowMs = 25, highMs = 25, clock = pr
  * error in ms (null without `precise`).
  */
 async function slowInit(t, addr, { bitMs = SLOW_BIT_MS, precise = true, parity = 'none', listenMs = 1500, clock = preciseClock } = {}) {
+  // Deliberately not wakeup.js's slowInit: this one only sends and listens (no idle wait, no
+  // acknowledgement) and can vary the bit time, edge timing and parity, which the tool never does.
   const bits = addressBits(addr);
   if (parity !== 'none') {
     const ones = bits.slice(1, 9).reduce((a, b) => a + b, 0);
@@ -246,10 +249,7 @@ async function slowInit(t, addr, { bitMs = SLOW_BIT_MS, precise = true, parity =
  * ~address. The capture lasts `listenMs`, or ends after `stopAfter` bytes.
  */
 async function ackKb2(t, kb2, { delayMs = SLOW_ACK_MS, listenMs = 400, stopAfter, clock = preciseClock } = {}) {
-  await waitUntil(clock, clock.now() + delayMs);
-  await t.flushInput();
-  const ack = ~kb2 & 0xff;
-  await t.write([ack]);
+  const ack = await acknowledgeKb2(t, kb2, { delayMs, clock });
   return { ack, heard: await capture(t, listenMs, { clock, max: stopAfter }) };
 }
 

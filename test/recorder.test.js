@@ -7,6 +7,7 @@ const os = require('os');
 const path = require('path');
 const { Connection } = require('../src/connection');
 const { recordRun, EventDetector, EVERY_CYCLE, ROTATING_TIMEOUT_MS } = require('../src/recorder');
+const { loadRecording } = require('../src/recordings');
 const { MockEcuTransport } = require('./mockecu');
 
 const M = 0x1234; // a made-up unlock multiplier; the real one lives in the user's own unlock.json
@@ -960,6 +961,37 @@ test('unlocking in the middle of a recording adds the unlock-only values from th
   assert.equal(run.battery.last, 13.8);
   assert.equal(readCsv(run.csvPath).rows.at(-1).battery, '13.8');
   run.stop();
+  await conn.disconnect();
+});
+
+test('one sample time: a live graph point and the CSV row t_ms of the same sample are equal, and so is the replay of the file', async () => {
+  const { conn, logDir } = await connectedBike();
+  const run = recordRun(conn, { logDir });
+  const seen = [];
+  run.on('sample', (s) => seen.push(s));
+  for (let i = 0; i < 6; i++) await run.step();
+  assert.ok(seen.every((s) => s.cycleMs > 0), 'a cycle takes time, so a time stamped at its end would differ');
+  const live = run.series().battery; // read in every cycle: one point per sample
+  assert.equal(live.length, seen.length);
+  const csvTimes = readCsv(run.csvPath).rows.map((r) => Number(r.t_ms));
+  assert.deepEqual(live.map((p) => p[0]), csvTimes, 'the live graph and the CSV put each sample at the same moment');
+  assert.deepEqual(live.map((p) => p[0]), seen.map((s) => s.t_ms));
+  assert.equal(live[0][0], 0, 'the first sample is when its cycle started: at the start');
+  run.stop();
+  await tick();
+  const replay = loadRecording(path.basename(run.csvPath), logDir).series.battery;
+  assert.deepEqual(replay, live, 'the replay of the recording is the live graph, point for point');
+  await conn.disconnect();
+});
+
+test('the recording is a LogSink: a second one in the same instant gets a numbered name and the file keeps the old format', async () => {
+  const { conn, logDir } = await connectedBike();
+  const a = recordRun(conn, { logDir });
+  assert.match(path.basename(a.csvPath), /^record-\d{4}-\d\d-\d\dT[\d-]+Z\.csv$/);
+  assert.equal(fs.readFileSync(a.csvPath, 'utf8'), `${HEADER.join(',')}\n`, 'the header is written when the file is opened');
+  const b = recordRun(conn, { logDir });
+  assert.match(path.basename(b.csvPath), /^record-\d{4}-\d\d-\d\dT[\d-]+Z-2\.csv$/);
+  b.stop();
   await conn.disconnect();
 });
 

@@ -4,17 +4,15 @@ const fs = require('fs');
 const path = require('path');
 const { LiveRun } = require('./liverun');
 const svc = require('./services');
+const { logStamp, DEFAULT_LOG_DIR } = require('./logsink');
+const { idText } = require('./format');
 
-const DEFAULT_LOG_DIR = path.join(__dirname, '..', 'logs');
 const DEFAULT_FROM = 0x0000;
 const DEFAULT_TO = 0x00ff;
 const EXTENDED_FROM = 0x0100;
 const EXTENDED_TO = 0x03ff;
 const DEFAULT_TIMEOUT_MS = 300;
 const DEFAULT_MAX_MS = 10 * 60_000;
-
-const idText = (id) => `0x${id.toString(16).padStart(4, '0')}`;
-const stamp = (ms) => new Date(ms).toISOString().replace(/[:.]/g, '-');
 
 /**
  * Sweep service 0x22 over an id range and list every id this ECU answers (read-only: the
@@ -27,6 +25,9 @@ const stamp = (ms) => new Date(ms).toISOString().replace(/[:.]/g, '-');
  *   const run = discoverRun(conn, { from: 0, to: 0xff });
  *   await run.start();
  *   run.found                // [{ id, value, hex, bytes, name }] (name: the bike's own, or null)
+ *
+ * It deliberately does not use the polled-item set (src/pollset.js): every id is asked exactly once,
+ * so there is no strike policy, no stale value and no rotation to share; a sweep is a cursor over a range.
  *
  * Options: from (0x0000), to (0x00ff), timeout per id in ms (300), maxMs (10 minutes: a
  * sweep that is not done by then ends with `stopReason`), logDir. When the run ends, however
@@ -119,7 +120,7 @@ class Discovery extends LiveRun {
 
   _save(outcome) {
     const s = this.sampler;
-    const file = path.join(this.logDir, `discovered-ids-${stamp(this.startedAt)}.json`);
+    const file = path.join(this.logDir, `discovered-ids-${logStamp(this.startedAt)}.json`);
     const result = {
       startedAt: new Date(this.startedAt).toISOString(),
       durationMs: this.conn.clock.now() - this.startedAt,
@@ -186,4 +187,4 @@ async function takeSnapshot(conn, ids, opts) {
   return { at: run.startedAt, ids: [...ids], values: run.sampler.values };
 }
 
-module.exports = { Discovery, discoverRun, snapshotRun, takeSnapshot, DEFAULT_FROM, DEFAULT_TO, EXTENDED_FROM, EXTENDED_TO, DEFAULT_MAX_MS };
+module.exports = { Discovery, discoverRun, snapshotRun, takeSnapshot, DEFAULT_FROM, DEFAULT_TO, EXTENDED_FROM, EXTENDED_TO };

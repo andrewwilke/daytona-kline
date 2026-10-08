@@ -145,13 +145,16 @@ test('the stop route ends the idle speed control test with its stop; a disconnec
 });
 
 test('the page: the output tests panel is explanation + checkbox + enable button, confirm() before each test, nothing remembered, and its script compiles', () => {
+  // The panel's markup is in index.html; its script is the page's own file (public/js/app.js).
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+  const script = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'app.js'), 'utf8');
   assert.ok(html.includes('The bike is stationary, the engine is off, the key is on, I have clear access to the fan and exhaust valve, and I understand these tests make the bike move or run parts'));
   assert.match(html, /<button class="danger" id="btnOutEnable" disabled>Enable output tests<\/button>/);
   assert.match(html, /<input type="checkbox" id="outAck"/);
-  assert.match(html, /if \(!confirm\(`Run the \$\{t\.name\} test now\?/);
-  assert.match(html, /confirmed: true, token: outToken/);
-  const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
-  assert.doesNotMatch(script.slice(script.indexOf('// ---- Output tests'), script.indexOf('// ---- Vitals and tabs')), /localStorage|sessionStorage|document\.cookie/, 'enabling is per page session, not remembered (the tab memory below it is only the selected tab)');
+  assert.match(script, /if \(!confirm\(`Run the \$\{t\.name\} test now\?/);
+  assert.match(script, /confirmed: true, token: outToken/);
+  const from = script.indexOf('// ---- Output tests'), to = script.indexOf('// ---- Vitals and tabs');
+  assert.ok(from > 0 && to > from, 'the output tests region of the page script is found');
+  assert.doesNotMatch(script.slice(from, to), /localStorage|sessionStorage|document\.cookie/, 'enabling is per page session, not remembered (the tab memory below it is only the selected tab)');
   new (require('vm').Script)(script); // throws on a syntax error
 });

@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const { KwpError, KwpNegativeResponse, FAILURE, hex } = require('./kwp');
+const { hex0x } = require('./format');
 
 const SVC_SECURITY_ACCESS = 0x27;
 const LEVEL_SEED = 0x05; // the only levels this tool ever sends
@@ -60,7 +61,7 @@ function loadMultiplier(file) {
 }
 
 function refused(e, kind, what) {
-  return new UnlockError(kind, `the ECU refused ${what} (code 0x${e.code.toString(16).padStart(2, '0')})`, e.code);
+  return new UnlockError(kind, `the ECU refused ${what} (code ${hex0x(e.code)})`, e.code);
 }
 
 /**

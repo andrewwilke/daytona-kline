@@ -9,36 +9,58 @@ const { SerialTransport } = require('./src/transport');
 const { hex } = require('./src/kwp');
 const { Connection } = require('./src/connection');
 const svc = require('./src/services');
-const { blockRun, gaugeRun, switchRun, probeRun } = require('./src/liverun');
-const { recordRun } = require('./src/recorder');
+const { createRuns, panelAnalogs, SWITCHES_NOTE } = require('./src/runs');
 const recordings = require('./src/recordings');
-const { discoverRun, takeSnapshot } = require('./src/discover');
+const { takeSnapshot } = require('./src/discover');
 const outputtests = require('./src/outputtests');
 
 const PORT = 3675;
 
 const conn = new Connection();
 
-/** The run behind each page feature; `live` is cleared when its run ends, the others keep their last results. */
+/**
+ * Every run the page can start (dashboard, switch watcher, recording, id scan, sensor block read,
+ * probe) lives in the run coordinator: who may use the K-line and in what order is decided there
+ * (src/runs.js), and this file only routes to it and renders what a run reports.
+ */
+const runs = createRuns(conn);
+
+/**
+ * What is left of the old run state, as a compatibility export for the tests: the run behind each
+ * page feature, read from the coordinator (`live` is cleared when its run ends, the others keep their
+ * last results; assigning null to `discover` forgets the scan's results), `logDir` (where the recorder,
+ * the id scan and the output test log write; the project's logs folder unless a test sets it) and
+ * `liveError`. `snapshot` ({ a, b, changes, note } of the "Find more IDs" panel) and `outputTestToken`
+ * (handed out by 'POST /api/outputtest/enable' to the one page that enabled output tests; starting a
+ * test needs it) are not runs and live here.
+ */
 const state = {
-  gauges: null,
-  live: null,
-  liveError: null, // why the last sensor block run gave up on its own
-  probe: null,
-  switches: null,
-  record: null,
-  discover: null,
-  snapshot: null, // { a, b, changes, note } of the "Find more IDs" panel
-  logDir: undefined, // where the recorder, the id scan and the output test log write; the project's logs folder unless a test sets it
-  outputTestToken: null, // handed out by 'POST /api/outputtest/enable' to the one page that enabled output tests; starting a test needs it
+  snapshot: null,
+  outputTestToken: null,
 };
+const runView = (key, feature) => Object.defineProperty(state, key, {
+  enumerable: true,
+  get: () => runs.get(feature),
+  set(value) {
+    if (value !== null) throw new TypeError(`state.${key} is owned by the run coordinator: only null (forget it) can be assigned`);
+    runs.forget(feature);
+  },
+});
+runView('gauges', 'dashboard');
+runView('switches', 'switches');
+runView('record', 'recording');
+runView('discover', 'scan');
+runView('live', 'sensor');
+runView('probe', 'probe');
+Object.defineProperties(state, {
+  liveError: { enumerable: true, get: () => runs.notes.sensor ?? null }, // why the last sensor block run gave up on its own
+  logDir: { enumerable: true, get: () => runs.logDir, set: (dir) => { runs.logDir = dir; } },
+});
 
 // A page's "enabled" does not outlive the session: a new connection starts with the feature off.
 conn.on('state', ({ state: s }) => {
   if (s !== 'connected') state.outputTestToken = null;
 });
-
-const SWITCHES_NOTE = 'This bike description names no switch IDs, not available.';
 
 /**
  * A route for a read the ECU refuses until it is unlocked: needs a session, then
@@ -54,25 +76,8 @@ function gated(route, whenLocked = {}) {
   };
 }
 
-function startLive(id, { log = false, interval = 150 } = {}) {
-  const run = blockRun(conn, { id, interval, log });
-  state.live = run;
-  state.liveError = null;
-  // Reads that fail from the very start mean the request itself is refused: stop and say so.
-  run.on('fault', () => {
-    if (!run.samples && run.errors >= 3) {
-      state.liveError = `${run.lastError} (the sensor block read is an advanced tool; the ECU may not serve it)`;
-      run.stop();
-    }
-  });
-  run.on('end', () => {
-    if (state.live === run) state.live = null;
-  });
-  run.start();
-}
-
 /** Per-byte min/max as the arrays the page indexes by offset. */
-const series = (byKey, length = 0) => Array.from({ length }, (_, i) => byKey[i]);
+const perByte = (byKey, length = 0) => Array.from({ length }, (_, i) => byKey[i]);
 
 const probeView = (run) => run && {
   running: run.running,
@@ -85,17 +90,11 @@ const probeView = (run) => run && {
 };
 
 /** The analog extras of a switch run as tiles: the value, or `available: false` once the ECU stayed silent on one. */
-const panelAnalogs = () => conn.bike.analogs.filter((a) => a.panel !== false); // `panel: false` ones are only recorded
-const analogView = (run) => panelAnalogs().map((def) => {
+const analogView = (run) => panelAnalogs(conn).map((def) => {
   const r = run.sampler.analogs[def.key];
   const available = !!r && !run.sampler.analogsUnavailable.includes(def.key);
   return { key: def.key, label: def.label, id: def.id, unit: def.unit, note: def.note ?? null, verified: !!def.verified, available, value: available ? r.value : null, hex: available ? r.hex : null };
 });
-
-/** Starting a recording or an id scan while the other one runs would double the traffic on the one K-line. */
-function refuseWhileRunning(other) {
-  if (state[other]?.running) throw new Error(`${other === 'record' ? 'a recording' : 'the id scan'} is running: stop it first`);
-}
 
 const snapshotView = () => {
   const s = state.snapshot;
@@ -115,9 +114,42 @@ async function readBody(req) {
   return raw ? JSON.parse(raw) : {};
 }
 
+/**
+ * The routes: `'METHOD /path': async (body, query) => object`, answered as `{ ok: true, ...object }` (or
+ * `{ ok: false, error }` when it throws). Each is a thin front for a module; none keeps run state of its own.
+ *
+ * Who may use the K-line is decided by the run coordinator (src/runs.js), not by the page:
+ *   - a recording or an id scan stops the dashboard and the switch watcher and brings them back when it ends;
+ *   - 'POST /api/gauges/start' while one of them runs answers `{ paused: true, note }` and the dashboard
+ *     starts when it ends; 'GET /api/switches' answers its usual shape plus `paused: true` and a `note`
+ *     (and no tiles) instead of starting a switch run.
+ *
+ * Added for the page to say what the owner did (all of them JSON, all needing a session):
+ *   GET  /api/runs             what is running (`running`: feature, role, run, startedAt), what is paused and
+ *                              why (`paused`: feature, by, why, note), which features the owner stopped
+ *                              (`stoppedByOwner`), what is waiting for the unlock (`waiting`), which exclusive
+ *                              run is on (`exclusive`: 'recording', 'scan' or null) and `connected`. Read-only.
+ *   POST /api/runs/start       { feature: 'dashboard' | 'switches' }: the owner starts it (clears the owner's
+ *                              stop). Answers `started`, `paused: true` + `note` while a recording or scan runs
+ *                              (it starts when that ends), or `unavailable: true` + `note` (the unlock), and
+ *                              `runs`, the answer of GET /api/runs.
+ *   POST /api/runs/stop        { feature: 'dashboard' | 'switches' }: the owner stopped it; nothing starts it
+ *                              again until the owner starts it or the next connection. Answers `runs`.
+ *   POST /api/runs/reconcile   start what should be running: the dashboard, and the switch watcher once
+ *                              unlocked, unless the owner stopped them or a recording or scan is on. Answers
+ *                              `started` (feature names) and `runs`. The page calls it once connected.
+ * 'POST /api/gauges/stop' is the owner's Stop of the dashboard (same as runs/stop with 'dashboard').
+ */
+const OWNER_FEATURES = ['dashboard', 'switches'];
+const ownerFeature = (body) => {
+  if (!OWNER_FEATURES.includes(body.feature)) throw new Error(`feature must be one of: ${OWNER_FEATURES.join(', ')}`);
+  return body.feature;
+};
+
 const routes = {
   'GET /api/status': async () => {
     const cfg = conn.config();
+    const live = runs.get('sensor');
     return {
       connected: conn.state === 'connected',
       state: conn.state,
@@ -132,17 +164,35 @@ const routes = {
       addrMode: conn.addrMode,
       keyBytes: conn.keyBytes ? hex(conn.keyBytes) : null,
       dataBlockId: conn.dataBlockId(),
-      live: state.live
+      live: live
         ? {
-            id: state.live.sampler.id,
-            samples: state.live.samples,
-            errors: state.live.errors,
-            lastError: state.live.lastError,
-            csvPath: state.live.csvPath,
+            id: live.sampler.id,
+            samples: live.samples,
+            errors: live.errors,
+            lastError: live.lastError,
+            csvPath: live.csvPath,
           }
         : null,
-      probe: probeView(state.probe),
+      probe: probeView(runs.get('probe')),
     };
+  },
+  'GET /api/runs': async () => runs.status(),
+  'POST /api/runs/start': async (body) => {
+    const r = runs.start(ownerFeature(body));
+    return {
+      started: r.started,
+      ...(r.paused ? { paused: true, note: r.paused.note } : {}),
+      ...(r.unavailable ? { unavailable: true, note: r.unavailable } : {}),
+      runs: runs.status(),
+    };
+  },
+  'POST /api/runs/stop': async (body) => {
+    runs.stop(ownerFeature(body));
+    return { runs: runs.status() };
+  },
+  'POST /api/runs/reconcile': async () => {
+    conn.requireSession();
+    return { started: runs.reconcile(), runs: runs.status() };
   },
   'GET /api/ports': async () => ({ ports: await SerialTransport.listPorts() }),
   'POST /api/connect': async (body) => {
@@ -165,17 +215,14 @@ const routes = {
     await svc.clearDtcs(conn.requireSession());
     return {};
   },
+  // While a recording or an id scan runs the dashboard does not start now: `{ paused: true, note }`, and it starts when that ends.
   'POST /api/gauges/start': async () => {
-    conn.requireSession();
-    if (!state.gauges?.running) {
-      state.gauges = gaugeRun(conn);
-      state.gauges.start();
-    }
-    return {};
+    const { paused } = runs.start('dashboard');
+    return paused ? { paused: true, note: paused.note } : {};
   },
-  'POST /api/gauges/stop': async () => { state.gauges?.stop(); return {}; },
+  'POST /api/gauges/stop': async () => { runs.stop('dashboard'); return {}; },
   'GET /api/gauges': async (body, query = new URLSearchParams()) => {
-    const g = state.gauges;
+    const g = runs.get('dashboard');
     return {
       running: !!g?.running,
       defs: conn.bike.gauges,
@@ -190,61 +237,57 @@ const routes = {
     };
   },
   // The page paces this one itself: each request is one cycle of a switch run. The Daytona's switch IDs
-  // are behind the ECU unlock; `available: false` otherwise (with `locked: true` when that is why).
+  // are behind the ECU unlock; `available: false` otherwise (with `locked: true` when that is why). While a
+  // recording or an id scan holds the line, or after the owner stopped the watcher, it answers the same shape with
+  // `paused: true` and a `note` and starts nothing.
   'GET /api/switches': gated(async () => {
     if (!conn.bike.switchIds.length) return { available: false, rows: [], note: SWITCHES_NOTE };
-    if (!state.switches?.running) state.switches = switchRun(conn, { analogs: panelAnalogs() });
-    await state.switches.step();
-    const rows = svc.switchTiles(conn.bike, state.switches.latest.rows);
-    const analogs = analogView(state.switches);
+    const { run, paused } = runs.ensure('switches');
+    if (paused) return { available: false, rows: [], analogs: [], paused: true, note: paused.note };
+    await run.step();
+    const rows = svc.switchTiles(conn.bike, run.latest.rows);
+    const analogs = analogView(run);
     return rows.length ? { available: true, rows, analogs } : { available: false, rows, analogs, note: 'The ECU served none of the switch IDs, not available.' };
   }, { available: false, rows: [], analogs: [] }),
   // The recorder works locked too (OBD values only; `view().locked` and `lockedNote` say what is skipped).
+  // The coordinator stops the dashboard and the switch watcher for it and brings them back afterwards.
   'POST /api/record/start': async (body) => {
-    conn.requireSession();
-    if (state.record?.running) return {};
-    refuseWhileRunning('discover');
-    state.gauges?.stop();
-    state.switches?.stop();
-    state.record = recordRun(conn, { minutes: body.minutes ?? undefined, logDir: state.logDir });
-    state.record.start();
+    runs.start('recording', { minutes: body.minutes });
     return {};
   },
-  'POST /api/record/stop': async () => { state.record?.stop(); return {}; },
+  'POST /api/record/stop': async () => { runs.stop('recording'); return {}; },
   'POST /api/record/mark': async (body) => {
-    if (!state.record?.running) throw new Error('not recording');
-    const marker = state.record.mark(body.text);
+    const rec = runs.active('recording');
+    if (!rec) throw new Error('not recording');
+    const marker = rec.mark(body.text);
     if (!marker) throw new Error('type a note to mark');
     return { marker };
   },
-  'GET /api/record': async (body, query = new URLSearchParams()) => (state.record
-    ? { active: true, ...state.record.view(), ...(query.has('since') ? { series: state.record.series(Number(query.get('since'))) } : {}) }
-    : { active: false }),
-  // The channels a graph can show: the bike description's gauges, analogs and switches (flags draw as steps).
-  'GET /api/graphs': async () => ({
-    channels: [
-      ...conn.bike.gauges.filter((d) => d.type !== 'text' && d.type !== 'bitpos').map((d) => ({ key: d.key, label: d.label, unit: d.unit, kind: 'value', min: d.min ?? null, max: d.max ?? null })),
-      ...conn.bike.analogs.map((d) => ({ key: d.key, label: d.label, unit: d.unit, kind: 'value', min: null, max: null })),
-      ...conn.bike.switches.map((d) => ({ key: d.key, label: d.name, unit: '', kind: 'flag', bad: d.bad ?? null, onText: d.onText ?? 'ON', offText: d.offText ?? 'OFF' })),
-    ],
-  }),
+  'GET /api/record': async (body, query = new URLSearchParams()) => {
+    const rec = runs.get('recording');
+    return rec
+      ? { active: true, ...rec.view(), ...(query.has('since') ? { series: rec.series(Number(query.get('since'))) } : {}) }
+      : { active: false };
+  },
   'GET /api/recordings': async () => ({ recordings: recordings.listRecordings(state.logDir) }),
   'GET /api/recordings/load': async (body, query = new URLSearchParams()) => recordings.loadRecording(query.get('name'), state.logDir),
+  // An id scan, like a recording, holds the line alone: the coordinator refuses it while a recording runs and
+  // stops the dashboard and the switch watcher for it.
   'POST /api/discover/start': gated(async (body) => {
-    if (state.discover?.running) return {};
-    refuseWhileRunning('record');
-    state.discover = discoverRun(conn, { from: body.from ?? undefined, to: body.to ?? undefined, logDir: state.logDir });
-    state.discover.start();
+    runs.start('scan', { from: body.from, to: body.to });
     return {};
   }),
-  'POST /api/discover/stop': async () => { state.discover?.stop(); return {}; },
-  'GET /api/discover': async () => ({ active: !!state.discover, ...(state.discover?.view() ?? {}), snapshot: snapshotView() }),
+  'POST /api/discover/stop': async () => { runs.stop('scan'); return {}; },
+  'GET /api/discover': async () => {
+    const scan = runs.get('scan');
+    return { active: !!scan, ...(scan?.view() ?? {}), snapshot: snapshotView() };
+  },
   // Snapshot A reads the ids the last scan found (or the ones the bike table names, before any scan); B reads the same ids
   // again and answers with the ids whose value changed. Each takes a second or two.
   'POST /api/snapshot': gated(async (body) => {
-    if (state.record?.running || state.discover?.running) throw new Error('stop the recording or the id scan first');
+    runs.requireNoExclusive('stop the recording or the id scan first');
     if (body.which === 'a') {
-      const scanned = state.discover?.found.map((f) => f.id) ?? [];
+      const scanned = runs.get('scan')?.found.map((f) => f.id) ?? [];
       const ids = scanned.length ? scanned : svc.knownIds(conn.bike);
       state.snapshot = {
         a: await takeSnapshot(conn, ids),
@@ -288,23 +331,18 @@ const routes = {
     return { test: test?.view() ?? null };
   },
   'POST /api/probe': gated(async (body) => {
-    if (state.probe?.running) return {};
-    state.probe = probeRun(conn, { from: body.from ?? 0x01, to: body.to ?? 0xff });
-    state.probe.start();
+    runs.start('probe', { from: body.from ?? 0x01, to: body.to ?? 0xff });
     return {};
   }),
   'POST /api/live/start': gated(async (body) => {
-    startLive(conn.dataBlockId(body.id), {
-      log: !!body.log,
-      interval: body.interval ?? 150,
-    });
+    runs.start('sensor', { id: conn.dataBlockId(body.id), log: !!body.log, interval: body.interval ?? 150 });
     return {};
   }),
-  'POST /api/live/stop': async () => { state.live?.stop(); return {}; },
-  'POST /api/live/reset': async () => { state.live?.resetRange(); return {}; },
+  'POST /api/live/stop': async () => { runs.stop('sensor'); return {}; },
+  'POST /api/live/reset': async () => { runs.get('sensor')?.resetRange(); return {}; },
   'GET /api/live/latest': async () => {
-    const run = state.live;
-    if (!run) return { active: false, error: state.liveError ?? undefined };
+    const run = runs.get('sensor');
+    if (!run) return { active: false, error: runs.notes.sensor ?? undefined };
     const data = run.latest?.data;
     return {
       active: true,
@@ -314,12 +352,33 @@ const routes = {
       lastError: run.lastError,
       csvPath: run.csvPath,
       raw: data ? [...data] : null,
-      min: series(run.min, data?.length),
-      max: series(run.max, data?.length),
+      min: perByte(run.min, data?.length),
+      max: perByte(run.max, data?.length),
       fields: run.latest?.fields ?? [],
     };
   },
 };
+
+/**
+ * The page's scripts (public/js/*.js) are the only static files served besides the page itself. A request
+ * is answered only when its whole path is `/js/<name>.js` with a plain name (lower case letters, digits and
+ * dashes: no dots, slashes, percent signs or backslashes, so nothing can climb out of the folder) and that
+ * name is a file in public/js; everything else, directories and sub-folders included, is not found.
+ */
+const PAGE_SCRIPT_DIR = path.join(__dirname, 'public', 'js');
+const PAGE_SCRIPT_PATH = /^\/js\/([a-z0-9-]+\.js)$/;
+function pageScript(pathname) {
+  const m = PAGE_SCRIPT_PATH.exec(pathname);
+  if (!m) return null;
+  const file = path.join(PAGE_SCRIPT_DIR, m[1]);
+  try {
+    // the name must be an entry of the folder as listed (never a device name or anything the file system resolves for us)
+    if (!fs.readdirSync(PAGE_SCRIPT_DIR).includes(m[1])) return null;
+    return fs.statSync(file).isFile() ? fs.readFileSync(file) : null;
+  } catch {
+    return null;
+  }
+}
 
 const server = http.createServer(async (req, res) => {
   const [pathname, queryText = ''] = req.url.split('?');
@@ -336,6 +395,12 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     res.end(fs.readFileSync(path.join(__dirname, 'public', 'index.html')));
+    return;
+  }
+  const script = req.method === 'GET' ? pageScript(pathname) : null;
+  if (script) {
+    res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff' });
+    res.end(script);
     return;
   }
   res.writeHead(404);
@@ -367,4 +432,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { routes, conn, state, server };
+module.exports = { routes, conn, runs, state, server };

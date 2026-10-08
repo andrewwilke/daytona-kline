@@ -150,6 +150,19 @@ async function listenForKeyBytes(t, { syncMs = 1500 } = {}) {
 }
 
 /**
+ * Send ~KB2, `delayMs` after the call (default SLOW_ACK_MS, inside the 25-50 ms W4 window; a later one
+ * is ignored), after flushing what the receive buffer holds. Resolves with the byte sent. The tool's
+ * slow init and the probe kit's raw one both end their handshake with it.
+ */
+async function acknowledgeKb2(t, kb2, { delayMs = SLOW_ACK_MS, clock }) {
+  await waitUntil(clock, clock.now() + delayMs);
+  await t.flushInput();
+  const ack = ~kb2 & 0xff;
+  await t.write([ack]);
+  return ack;
+}
+
+/**
  * Slow init: after `idleMs` of bus idle, send `address` at 5 baud (start bit
  * low, eight data bits LSB first, stop bit high, no parity) by bit-banging the
  * break line. Then the ECU answers 0x55 (sync), KB1, KB2; we acknowledge with
@@ -165,10 +178,7 @@ async function slowInit(t, address, { bitMs = SLOW_BIT_MS, idleMs = SLOW_IDLE_MS
   if (!keyBytes) throw fail(why);
   const [kb1, kb2] = keyBytes;
 
-  await waitUntil(clock, clock.now() + SLOW_ACK_MS);
-  await t.flushInput();
-  const ack = ~kb2 & 0xff;
-  await t.write([ack]);
+  const ack = await acknowledgeKb2(t, kb2, { clock });
   // The cable echoes our own byte first, then the ECU sends ~address.
   let reply = await t.readByte(400);
   if (reply === ack) reply = await t.readByte(400);
@@ -285,6 +295,6 @@ async function wakeEcu(transport, { bike = DEFAULT_BIKE, prefer, targets, initMo
 
 module.exports = {
   wakeEcu, tryWakeUp, attemptOrder, GENERIC_TARGETS, IDLE_MS, SETTLE_MS,
-  SLOW_BIT_MS, SLOW_IDLE_MS, SLOW_RETRY_MS, SLOW_TRIES, SLOW_ACK_MS,
-  addressBits, bitBang, listenForKeyBytes,
+  SLOW_BIT_MS, SLOW_IDLE_MS, SLOW_RETRY_MS, SLOW_ACK_MS,
+  addressBits, bitBang, listenForKeyBytes, acknowledgeKb2,
 };

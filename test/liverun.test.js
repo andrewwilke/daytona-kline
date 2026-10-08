@@ -305,6 +305,20 @@ test('gauges: on a connection unlocked at connect the unlock-only gauges are pol
   await conn.disconnect();
 });
 
+test('gauges: the graph extras are the injection pulse every cycle and one of the flags per cycle in turn, only while unlocked', async () => {
+  const { t, conn } = await connectedUnlockable({}, { autoUnlock: false });
+  const run = gaugeRun(conn, { defs: DEFAULT_BIKE.gauges.filter((d) => d.key === 'rpm') });
+  await run.step();
+  await run.step();
+  assert.deepEqual(commonIds(t), [], 'locked: none of them is asked');
+  assert.deepEqual(await conn.unlock(), { state: 'unlocked', reason: null });
+  const from = t.requests.length;
+  for (let i = 0; i < 5; i++) await run.step();
+  assert.deepEqual(commonIds(t, from), [0x110, 0x60, 0x110, 0x63, 0x110, 0x60, 0x110, 0x63, 0x110, 0x60]);
+  assert.equal(run.errors, 0);
+  await conn.disconnect();
+});
+
 test('gauges: a refusal of an unlock-only gauge marks it not available once, never an error, and it is not asked again', async () => {
   const { t, conn } = await connectedUnlockable();
   delete t.dataIds[0x07];
@@ -325,6 +339,23 @@ test('gauges: an ECU that refuses 0x22 although the connection says unlocked mar
   for (let i = 0; i < 4; i++) await run.step();
   assert.deepEqual(run.sampler.unsupported.sort(), ['battery', 'gear']);
   assert.equal(run.errors, 0);
+  await conn.disconnect();
+});
+
+test('gauges: while engine speed or throttle is changing only the fast PIDs are read, then the rotation comes back', async () => {
+  const { t, conn } = await connectedIso();
+  const run = gaugeRun(conn);
+  const fast = DEFAULT_BIKE.gauges.filter((d) => !d.requiresUnlock && d.fast).map((d) => d.pid); // engine speed and throttle
+  const readsOfStep = async () => {
+    const before = t.requests.length;
+    await run.step();
+    return modeOnePids(t, before);
+  };
+  assert.equal((await readsOfStep()).length, fast.length + 1, 'a steady cycle: the fast ones and one other');
+  t.pids[0x0c] = [0x1f, 0x40]; // engine speed jumps from 4000 to 2000 rpm
+  assert.equal((await readsOfStep()).length, fast.length + 1, 'the cycle that sees the change is still a full one');
+  for (let i = 0; i < 4; i++) assert.deepEqual(await readsOfStep(), fast, 'then short cycles while it was moving');
+  assert.equal((await readsOfStep()).length, fast.length + 1, 'steady again: the rotation is back');
   await conn.disconnect();
 });
 
@@ -423,6 +454,34 @@ test('the gauge CSV has a column per gauge with the latest value, and the PIDs r
   await conn.disconnect();
 });
 
+test('the run CSV time column and the graph history use the sample time: when the cycle started', async () => {
+  const { conn } = await connectedIso();
+  const file = path.join(scratch(), 'gauges.csv');
+  const run = gaugeRun(conn, { logPath: file });
+  const seen = [];
+  run.on('sample', (s) => seen.push(s.t_ms));
+  await stopAfter(run, 4);
+  assert.equal(seen.length, 4);
+  assert.ok(seen[1] > seen[0], 'the cycles take time');
+  assert.deepEqual(run.history.rpm.map((p) => p[0]), seen, 'the history is stamped with the sample time');
+  const times = fs.readFileSync(file, 'utf8').trim().split('\n').slice(1).map((l) => Date.parse(l.split(',')[0]));
+  assert.deepEqual(times, seen.map((t) => run.startedAt + t), 'the CSV row is stamped with the same moment');
+  await conn.disconnect();
+});
+
+test('a run CSV never goes over an earlier one: log: true takes a numbered name when the file exists', async () => {
+  const { conn } = await connected();
+  const logDir = path.join(scratch(), 'logs');
+  const a = blockRun(conn, { log: true, logDir });
+  const b = blockRun(conn, { log: true, logDir });
+  assert.notEqual(a.csvPath, b.csvPath);
+  assert.equal(path.dirname(b.csvPath), logDir);
+  assert.match(path.basename(b.csvPath), /^run-\d{4}-\d\d-\d\dT[\d-]+Z(-2)?\.csv$/);
+  a.stop();
+  b.stop();
+  await conn.disconnect();
+});
+
 test('the gauge CSV carries the unlock-only gauges once they are read, with their ids in the raw column', async () => {
   const { conn } = await connectedUnlockable();
   const file = path.join(scratch(), 'gauges.csv');
@@ -518,6 +577,17 @@ test('switches on an unlocked bike are read, the refused and silent ids dropped 
   assert.equal(commonIds(t).filter((id) => id === 0x40).length, 6, 'a refused id is asked once per scan (not resent) for 6 scans');
   assert.equal(commonIds(t).filter((id) => id === 0x70).length, 12, 'a silent one is asked twice per scan (resent once) for 6 scans');
   assert.equal(commonIds(t).filter((id) => id === 0x41).length, 7, 'an id that answers is asked once per scan, 7 scans');
+  await conn.disconnect();
+});
+
+test('switches: an id named twice is asked once per scan, with one row', async () => {
+  const { t, conn } = await connected();
+  const run = switchRun(conn, { ids: [0x41, 0x60, 0x41] });
+  const before = t.requests.length;
+  const sample = await run.step();
+  assert.equal(t.requests.length - before, 2);
+  assert.deepEqual(sample.rows.map((r) => r.id), [0x41, 0x60]);
+  assert.deepEqual(run.sampler.ids, [0x41, 0x60]);
   await conn.disconnect();
 });
 

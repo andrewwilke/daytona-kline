@@ -1,15 +1,17 @@
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
 const { EventEmitter } = require('events');
 const { hex } = require('./kwp');
+const { hexNum } = require('./format');
 const svc = require('./services');
-
-const DEFAULT_LOG_DIR = path.join(__dirname, '..', 'logs');
+const { pollset, GAUGE_STRIKES, SWITCH_STRIKES } = require('./pollset');
+const { openLogSink, logStamp, DEFAULT_LOG_DIR } = require('./logsink');
 
 // Points kept per channel for the graphs (the newest ones; the recorder's CSV keeps everything).
 const HISTORY_POINTS = 2000;
+
+// A run whose first reads all fail this many times in a row has a request the ECU does not serve (see `failingFromStart`).
+const FIRST_READS_FAIL = 3;
 
 /**
  * A live run: something polled over the connection's session at a pace, with
@@ -37,13 +39,29 @@ const HISTORY_POINTS = 2000;
  * `start()`, for a front-end that polls on its own timer; it is still
  * cancelled with the session.
  *
+ * Sample time. A sample's time is when its cycle STARTED, in ms since the run
+ * started (`startedAt`), read once by the run before it calls the sampler and
+ * handed out as `ctx.t`; the run stamps it on the sample as `sample.t_ms`.
+ * Everything that carries a time for a sample uses that one value: the graph
+ * history (`history`, `series()`), the run CSV's `time` column (startedAt +
+ * t_ms) and the recorder's `t_ms` column. So a live graph and the replay of
+ * the same recording put a sample at the same moment. (A cycle takes time, so
+ * the values in a sample were read after its time; the recorder's `cycle_ms`
+ * says how long.) A sampler never reads the clock for a sample time itself.
+ *
+ * Log. With `log` / `logPath` a run writes its CSV through one LogSink
+ * (src/logsink.js): the run owns opening it, its failure (a 'fault' event) and
+ * closing it when the run ends. A subclass that writes its own rows (the
+ * recorder) passes `logSpec` and writes through `this._sink`.
+ *
  * Sampler contract (the kinds of run below implement it):
  *   name, interval            default run name and pause between cycles (ms)
  *   sample(session, ctx)      one cycle -> { channels, ... }; `channels` maps
  *                             a key (byte offset, gauge key, data id) to a
  *                             number and drives min/max. ctx is
- *                             { signal, cycle, error(e) }: `error` records a
- *                             failure the cycle survives.
+ *                             { signal, cycle, t, error(e) }: `t` is the sample
+ *                             time above; `error` records a failure the cycle
+ *                             survives.
  *   needsUnlock               optional: true for a run whose reads an ISO 9141
  *                             ECU refuses until it is unlocked; creating it
  *                             while the connection is not unlocked throws a
@@ -54,11 +72,15 @@ const HISTORY_POINTS = 2000;
  *                             format: `time,<names>,raw`, one row per sample
  */
 class LiveRun extends EventEmitter {
-  /** Options: name, interval (ms), log (record to logs/run-<time>.csv), logPath (record to this file, appended), logDir. */
-  constructor(conn, sampler, { name, interval, log = false, logPath, logDir = DEFAULT_LOG_DIR } = {}) {
+  /**
+   * Options: name, interval (ms), log (record to logs/run-<time>.csv, a numbered name if it exists), logPath
+   * (record to this file, appended), logDir, and for a subclass that writes its own rows `logSpec`
+   * { prefix, header, maxBytes }: a new `<logDir>/<prefix>-<time>.csv` with that header line and size limit.
+   */
+  constructor(conn, sampler, { name, interval, log = false, logPath, logDir = DEFAULT_LOG_DIR, logSpec = null } = {}) {
     super();
     const wantsLog = log || logPath != null;
-    if (wantsLog && !sampler.csvRow) throw new Error('this kind of run has no CSV format');
+    if (wantsLog && !logSpec && !sampler.csvRow) throw new Error('this kind of run has no CSV format');
     if (sampler.needsUnlock) svc.requireUnlock(conn);
     this.conn = conn;
     this.sampler = sampler;
@@ -71,11 +93,11 @@ class LiveRun extends EventEmitter {
     this.latest = null;
     this.outcome = null;
     this.startedAt = conn.clock.now();
+    this.endedAt = null;
     this.csvPath = null;
     this.resetRange();
-    this.history = {}; // key -> [[t_ms, value], ...] newest last, for the graphs
-    this._fd = null;
-    this._wroteHeader = false;
+    this.history = {}; // key -> [[t_ms, value], ...] newest last, for the graphs (t_ms: the sample time, see above)
+    this._sink = null;
     this._loop = null;
     this.done = new Promise((resolve) => { this._resolveDone = resolve; });
 
@@ -83,9 +105,14 @@ class LiveRun extends EventEmitter {
     this.signal = this._registration.signal;
     this._aborted = new Promise((resolve) => this.signal.addEventListener('abort', resolve, { once: true }));
     this.signal.addEventListener('abort', () => this._end('cancelled'), { once: true });
-    if (wantsLog) {
+    if (wantsLog || logSpec) {
       try {
-        this._openLog(logPath ?? path.join(logDir, `run-${new Date(this.startedAt).toISOString().replace(/[:.]/g, '-')}.csv`));
+        const where = logSpec ? { dir: logDir, prefix: logSpec.prefix, stamp: logStamp(this.startedAt) }
+          : logPath != null ? { file: logPath }
+            : { dir: logDir, prefix: 'run', stamp: logStamp(this.startedAt) };
+        this._sink = openLogSink({ ...where, maxBytes: logSpec?.maxBytes, onError: (e) => this._fail(e) });
+        this.csvPath = this._sink.path;
+        if (logSpec?.header !== undefined) this._sink.header(logSpec.header);
       } catch (e) {
         this._registration.cancel();
         throw e;
@@ -95,6 +122,31 @@ class LiveRun extends EventEmitter {
 
   get running() {
     return this.outcome === null;
+  }
+
+  /**
+   * True once the run's first FIRST_READS_FAIL reads all failed and none succeeded: the request itself is
+   * refused (or not served), not a flaky link. A front-end that wants to give up in that case (the CLI's
+   * `follow`, the sensor block feature of src/runs.js) stops the run on its 'fault' event when this is true
+   * and says `lastError`; the rule lives here once so they cannot drift apart.
+   */
+  get failingFromStart() {
+    return !this.samples && this.errors >= FIRST_READS_FAIL;
+  }
+
+  /** ms since the run started (frozen when it ends). */
+  get elapsedMs() {
+    return (this.endedAt ?? this.conn.clock.now()) - this.startedAt;
+  }
+
+  /** Bytes written to the CSV so far (0 without one). */
+  get csvBytes() {
+    return this._sink?.bytes ?? 0;
+  }
+
+  /** True while the CSV file is open (it is closed as soon as the run has ended). */
+  get csvOpen() {
+    return this._sink?.isOpen ?? false;
   }
 
   /** Poll until the run finishes, is stopped, or the session ends. Resolves with `outcome`. */
@@ -174,10 +226,12 @@ class LiveRun extends EventEmitter {
   async _cycle() {
     if (!this.running) throw new Error(`${this.name} run stopped`);
     let sample;
+    const t = this.conn.clock.now() - this.startedAt; // the sample time: when this cycle starts
     try {
       sample = await this.sampler.sample(this.conn.requireSession(), {
         signal: this.signal,
         cycle: this.cycles,
+        t,
         error: (e) => this._fail(e),
       });
     } catch (e) {
@@ -189,8 +243,9 @@ class LiveRun extends EventEmitter {
     if (!this.running) return null;
     this.cycles++;
     this.samples++;
+    sample.t_ms = t;
     this.latest = sample;
-    this._track(sample.channels);
+    this._track(sample.channels, t);
     this._record(sample);
     this.emit('sample', sample);
     return sample;
@@ -202,7 +257,8 @@ class LiveRun extends EventEmitter {
     this.emit('fault', e);
   }
 
-  _track(channels, t = this.conn.clock.now() - this.startedAt) {
+  /** Keep the channels of the sample at time `t` (its t_ms) for the graphs and min/max. */
+  _track(channels, t) {
     for (const k of Object.keys(channels)) {
       const v = channels[k];
       if (typeof v === 'number' && Number.isFinite(v)) {
@@ -215,43 +271,24 @@ class LiveRun extends EventEmitter {
     }
   }
 
-  _openLog(file) {
-    fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
-    this._fd = fs.openSync(file, 'a');
-    this.csvPath = file;
-  }
-
+  /** The run CSV: `time,<names>,raw`, one row per sample, `time` being the sample time (ISO). A run whose subclass writes its own rows (no csvRow) records nothing here. */
   _record(sample) {
-    if (this._fd === null) return;
+    if (!this._sink || !this.sampler.csvRow) return;
     const row = this.sampler.csvRow(sample);
-    let text = '';
-    if (!this._wroteHeader) {
-      text += `time,${row.names.join(',')},raw\n`;
-      this._wroteHeader = true;
-    }
-    text += `${new Date(this.conn.clock.now()).toISOString()},${row.values.join(',')},${row.raw}\n`;
-    try {
-      fs.writeSync(this._fd, text);
-    } catch (e) {
-      this._fail(new Error(`log write failed: ${e.message}`));
-      this._closeLog();
-    }
+    if (!this._sink.headerWritten) this._sink.header(`time,${row.names.join(',')},raw`);
+    this._sink.row(`${new Date(this.startedAt + sample.t_ms).toISOString()},${row.values.join(',')},${row.raw}`);
   }
 
-  _closeLog() {
-    if (this._fd === null) return;
-    try {
-      fs.closeSync(this._fd);
-    } catch {
-      // nothing more to do for a log that will not close
-    }
-    this._fd = null;
+  /** What happens to the log when the run ends: it is closed. A subclass that still has to write its last rows overrides this and closes the sink itself. */
+  _endLog() {
+    this._sink?.close();
   }
 
   _end(outcome) {
     if (this.outcome !== null) return;
     this.outcome = outcome;
-    this._closeLog();
+    this.endedAt = this.conn.clock.now();
+    this._endLog();
     this._registration.end();
     if (!this._loop) this._resolveDone(outcome);
     this.emit('end', outcome);
@@ -281,10 +318,6 @@ function blockRun(conn, { id = conn.dataBlockId(), map = conn.bike.sensorBlock, 
   return new LiveRun(conn, sampler, opts);
 }
 
-// A gauge whose PID the ECU listed but never answered, this many cycles in a
-// row, is treated as not served.
-const GAUGE_STRIKES = 3;
-
 /**
  * Poll the dashboard gauges (mode 01 PIDs): the `fast` ones every cycle plus
  * one of the others per cycle, in turn. The first cycle reads the ECU's list of
@@ -304,87 +337,104 @@ const GAUGE_STRIKES = 3;
  * unlock state each cycle (`svc.lockedGauges`): until then they are simply not
  * asked, and a refusal of one marks it unsupported at once. Options: defs
  * (default: the bike's gauges), interval (0: back to back), plus the LiveRun
- * log options.
+ * log options. The strike policy and the rotation belong to the polled-item set
+ * (src/pollset.js); this only reads and reports.
  */
 // Read-only extras the dashboard graphs besides the gauges, once the ECU is unlocked: the injection
 // pulse (what the fuel graph and map are about, read every cycle with engine speed and throttle) and
 // the flags that show a cut-out (one of them per cycle, taking turns). Keys of the bike description.
 const GRAPH_EXTRAS = ['injPulse1', 'fuelPump', 'tipOver'];
 const EXTRAS_EVERY_CYCLE = ['injPulse1'];
+// The recorder's EVERY_CYCLE (src/recorder.js) overlaps these three keys on purpose but is not derived from
+// them: it answers a different question (what shows a stall, 8 values read every cycle, in that order) and a
+// cycle of the dashboard has to stay short enough for the needles, so each list is its own decision.
 
-// While the engine runs, the background reads (the switch watcher) wait this long for the line, so the
-// gauges refresh quickly; otherwise they get it after the default wait.
-const RUNNING_RPM = 400;
-const BACKGROUND_AGE_RUNNING_MS = 800;
+// While engine speed or throttle is changing (a blip of the throttle, a rev), the dashboard reads only what the
+// needles and the fuel map need (engine speed, throttle and the injection pulse) for a few cycles, so they follow
+// the movement; once everything has been steady for that long the full rotation of the other values is back.
+const MOVING_RPM = 150;
+const MOVING_TPS = 1;
+const MOVING_CYCLES = 4;
+// An extra that is silent is skipped at once, not asked twice (the ECU skips a request now and then; the next cycle asks again).
+const EXTRA_TIMEOUT_MS = 350;
 
 function gaugeRun(conn, { defs = conn.bike.gauges, interval = 0, extras = GRAPH_EXTRAS, ...opts } = {}) {
   const extraDefs = extras
     .map((k) => [...conn.bike.analogs, ...conn.bike.switches].find((d) => d.key === k))
     .filter(Boolean);
-  const fast = defs.filter((d) => d.fast);
-  const slow = defs.filter((d) => !d.fast);
-  const strikes = {};
-  let turn = 0;
-  let extraTurn = 0;
-  const hex2 = (n) => n.toString(16).padStart(2, '0');
+  const gauges = pollset({
+    items: defs.map((def) => ({ key: def.key, pid: def.pid ?? null, gated: !!def.requiresUnlock, def })),
+    every: defs.filter((d) => d.fast).map((d) => d.key),
+    dropAfter: { every: GAUGE_STRIKES, rotation: GAUGE_STRIKES },
+    // Open unless an unlock-only gauge is held back: lockedGauges is the one rule for that (it is strict while there is no session yet).
+    gate: () => svc.lockedGauges(conn, defs).length === 0,
+    listSupported: svc.supportedPids, // a failure fails the cycle, and the next one asks again
+  });
+  // The graph extras are best effort: never dropped, never reported on (a silent one is just skipped), so
+  // the set only does their gating and rotation. All of them are 0x22 reads, asked while the unlock gate is open.
+  const extraSet = pollset({
+    items: extraDefs.map((def) => ({ key: def.key, pid: null, gated: true, def })),
+    every: extraDefs.filter((d) => EXTRAS_EVERY_CYCLE.includes(d.key)).map((d) => d.key),
+    gate: () => svc.needsUnlock(conn) === null,
+  });
+  let movingLeft = 0; // cycles still in the short, fast form
   const sampler = {
     name: 'gauges',
     interval,
     defs,
-    values: {},
-    unsupported: [],
-    supported: null,
-    markUnsupported(key) {
-      if (!sampler.unsupported.includes(key)) sampler.unsupported.push(key);
+    get moving() {
+      return movingLeft > 0;
+    },
+    get values() {
+      return gauges.view().values;
+    },
+    get unsupported() {
+      return gauges.view().unsupported;
+    },
+    get supported() {
+      return gauges.view().supported;
     },
     async sample(session, ctx) {
-      if (!sampler.supported) {
-        sampler.supported = await svc.supportedPids(session);
-        for (const d of defs) if (d.pid != null && !sampler.supported.has(d.pid)) sampler.markUnsupported(d.key);
-      }
-      const locked = svc.lockedGauges(conn, defs);
-      const served = (d) => !sampler.unsupported.includes(d.key) && !locked.includes(d.key);
-      const batch = fast.filter(served);
-      const others = slow.filter(served);
-      if (others.length) batch.push(others[turn++ % others.length]);
+      const plan = await gauges.plan(session, ctx);
+      const fastCycle = movingLeft > 0;
+      const before = { rpm: gauges.view().values.rpm?.value, tps: gauges.view().values.tps?.value };
+      const batch = fastCycle ? [...plan.every] : [...plan.every, ...plan.turns(1)];
       const channels = {};
       const reads = [];
-      for (const def of batch) {
+      for (const { def } of batch) {
         if (ctx.signal.aborted) break;
         try {
           const r = await svc.readGauge(session, def);
           if (r) {
-            strikes[def.key] = 0;
-            sampler.values[def.key] = { ...r, at: ctx.cycle };
+            gauges.report(def.key, { ...r, at: ctx.cycle });
             channels[def.key] = r.value;
-            reads.push(`${def.pid != null ? hex2(def.pid) : `22:${def.id.toString(16).padStart(4, '0')}`}=${hex(r.raw)}`);
+            reads.push(`${def.pid != null ? hexNum(def.pid) : `22:${hexNum(def.id, 4)}`}=${hex(r.raw)}`);
           } else if (def.pid == null) {
-            sampler.markUnsupported(def.key); // a refusal is an answer
-          } else if (!sampler.values[def.key] && (strikes[def.key] = (strikes[def.key] ?? 0) + 1) >= GAUGE_STRIKES) {
-            sampler.markUnsupported(def.key);
+            gauges.refuse(def.key); // a refusal is an answer
+          } else {
+            gauges.report(def.key, null);
           }
         } catch (e) {
           ctx.error(e);
         }
       }
-      if (svc.needsUnlock(conn) === null) {
-        const turns = extraDefs.filter((d) => !EXTRAS_EVERY_CYCLE.includes(d.key));
-        const now = extraDefs.filter((d) => EXTRAS_EVERY_CYCLE.includes(d.key));
-        if (turns.length) now.push(turns[extraTurn++ % turns.length]);
-        for (const def of now) {
-          if (ctx.signal.aborted) break;
-          try {
-            const bytes = await svc.readIdBytes(session, def.id, { retries: 1 });
-            if (bytes && bytes.length) {
-              const value = conn.bike.switches.includes(def) ? svc.decodeSwitch(def, bytes).active : svc.decodeGauge(def, bytes).value;
-              if (value !== null && value !== undefined) channels[def.key] = Number(value);
-            }
-          } catch (e) {
-            ctx.error(e);
+      const extraPlan = await extraSet.plan(session, ctx);
+      for (const { def } of fastCycle ? [...extraPlan.every] : [...extraPlan.every, ...extraPlan.turns(1)]) {
+        if (ctx.signal.aborted) break;
+        try {
+          const bytes = await svc.readIdBytes(session, def.id, { timeout: EXTRA_TIMEOUT_MS });
+          if (bytes && bytes.length) {
+            const value = conn.bike.switches.includes(def) ? svc.decodeSwitch(def, bytes).active : svc.decodeGauge(def, bytes).value;
+            if (value !== null && value !== undefined) channels[def.key] = Number(value);
           }
+        } catch (e) {
+          ctx.error(e);
         }
       }
-      session.backgroundAgeMs = sampler.values.rpm?.value > RUNNING_RPM ? BACKGROUND_AGE_RUNNING_MS : 300;
+      const after = gauges.view().values;
+      const moved = (a, b, limit) => a !== undefined && b !== undefined && Math.abs(a - b) >= limit;
+      if (moved(before.rpm, after.rpm?.value, MOVING_RPM) || moved(before.tps, after.tps?.value, MOVING_TPS)) movingLeft = MOVING_CYCLES;
+      else if (movingLeft > 0) movingLeft--;
       return { channels, reads };
     },
     csvRow: ({ reads }) => ({
@@ -396,61 +446,63 @@ function gaugeRun(conn, { defs = conn.bike.gauges, interval = 0, extras = GRAPH_
   return new LiveRun(conn, sampler, opts);
 }
 
-// An id the ECU never answered in this many full scans is not served: stop asking it.
-const NEVER_ANSWERED_SCANS = 6;
-
 /**
  * Poll the switch / relay data ids (readDataByCommonIdentifier, 0x22). On a bike
  * whose description says `switchesRequireUnlock` (the 2012 Daytona) this needs
  * the ECU unlock on an ISO 9141 connection. An id that has answered once keeps
  * its row for the rest of the run (`stale: true` and its last value while the ECU
- * is silent on it); an id that never answered in the first NEVER_ANSWERED_SCANS
+ * is silent on it); an id that never answered in the first SWITCH_STRIKES
  * scans is dropped. Sample: { rows: [{ id, value, hex, stale? }],
  * channels } channels keyed by id; `changed()`
- * lists the ones that moved. Options: ids (default: the bike's switchIds), analogs
+ * lists the ones that moved. Options: ids (default: the bike's switchIds; an id named twice
+ * is asked once), analogs
  * (bike `analogs` entries to read as well, default none: each is read once per cycle,
  * and one the ECU does not answer is dropped; `sampler.analogs` holds the newest
  * { value, raw, hex } per analog key and `sampler.analogsUnavailable` the dropped keys; they
  * are not channels, so `changed()` is about the switches only), interval (0).
  */
 function switchRun(conn, { ids = conn.bike.switchIds, analogs = [], interval = 0, ...opts } = {}) {
-  let live = [...ids];
-  let liveAnalogs = [...analogs];
-  const lastGood = new Map(); // id -> the newest row that answered
-  let scans = 0;
+  // Every id and every analog is read in every scan, and the same strike count drops either kind.
+  const idKeys = [...new Set(ids)];
+  const idSet = pollset({
+    items: idKeys.map((id) => ({ key: id, pid: null, gated: false })),
+    every: idKeys,
+    dropAfter: { every: SWITCH_STRIKES },
+  });
+  const analogSet = pollset({
+    items: analogs.map((def) => ({ key: def.key, pid: null, gated: false, def })),
+    every: analogs.map((d) => d.key),
+    dropAfter: { every: SWITCH_STRIKES },
+  });
   const sampler = {
     name: 'switches',
     interval,
     needsUnlock: conn.bike.switchesRequireUnlock,
-    analogs: {},
-    analogsUnavailable: [],
-    get ids() {
-      return live;
+    get analogs() {
+      return analogSet.view().values;
     },
-    async sample(session) {
+    get analogsUnavailable() {
+      return analogSet.view().unsupported;
+    },
+    get ids() {
+      return idSet.view().served;
+    },
+    async sample(session, ctx) {
       // The ECU now and then does not answer a request. An id that has answered once keeps its
       // row for the rest of the run (the last value, marked stale while it is silent); only an id
-      // that never answered in the first NEVER_ANSWERED_SCANS scans is dropped.
-      const fresh = await svc.readSwitches(session, live, { background: true });
-      scans++;
+      // that never answered in the first SWITCH_STRIKES scans is dropped.
+      const plan = await idSet.plan(session, ctx);
+      const fresh = await svc.readSwitches(session, plan.every.map((it) => it.key), { background: true });
+      for (const r of fresh) idSet.report(r.id, r.value !== null ? r : null);
+      const { stale } = idSet.view();
       const rows = [];
       for (const r of fresh) {
-        if (r.value !== null) {
-          lastGood.set(r.id, r);
-          rows.push(r);
-        } else if (lastGood.has(r.id)) {
-          rows.push({ ...lastGood.get(r.id), stale: true });
-        }
+        const row = idSet.value(r.id);
+        if (row) rows.push(stale.includes(r.id) ? { ...row, stale: true } : row);
       }
-      if (scans >= NEVER_ANSWERED_SCANS) live = live.filter((id) => lastGood.has(id));
-      for (const def of [...liveAnalogs]) {
-        const r = await svc.readAnalog(session, def, { background: true });
-        if (r) {
-          sampler.analogs[def.key] = r;
-        } else if (!sampler.analogs[def.key] && scans >= NEVER_ANSWERED_SCANS) {
-          liveAnalogs = liveAnalogs.filter((d) => d !== def);
-          sampler.analogsUnavailable.push(def.key);
-        }
+      const analogPlan = await analogSet.plan(session, ctx);
+      for (const { def } of analogPlan.every) {
+        analogSet.report(def.key, await svc.readAnalog(session, def, { background: true }));
       }
       return { rows, channels: Object.fromEntries(rows.map((r) => [r.id, r.value])) };
     },

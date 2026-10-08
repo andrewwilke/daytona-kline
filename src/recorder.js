@@ -1,12 +1,12 @@
 'use strict';
 
-const fs = require('fs');
 const path = require('path');
 const { LiveRun } = require('./liverun');
 const svc = require('./services');
 const { hex } = require('./kwp');
+const { pollset, SILENT_STRIKES, ROTATING_STRIKES, DEMOTE_STRIKES, SUPPORTED_RETRY_CYCLES } = require('./pollset');
+const { DEFAULT_LOG_DIR } = require('./logsink');
 
-const DEFAULT_LOG_DIR = path.join(__dirname, '..', 'logs');
 const DEFAULT_MINUTES = 10;
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
 
@@ -19,20 +19,16 @@ const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
 // rotation, one read in ~27 cycles missed brief trips). `warningLamp` (0x44) and `engineLamp`
 // (0x61) are the ECU's two flags of whether the dash is powered, so a glitch in the dash feed
 // shows up there (0x61 is answered only now and then and stays last).
+// (The dashboard's graph extras in src/liverun.js, GRAPH_EXTRAS, share three of these keys but are a smaller,
+// separate list on purpose: the dashboard has to stay quick for the needles, the recorder to catch a crank.)
 const EVERY_CYCLE = ['battery', 'rpmId', 'startSwitch', 'fuelPump', 'injPulse1', 'tipOver', 'warningLamp', 'engineLamp'];
 
-// A value that never gave an answer, this many reads in a row, is not served (the ECU now
-// and then skips a request, so one silence is not enough to give a value up). Every-cycle
-// values get 3 reads (silence costs a 500 ms wait, twice, with the resend), the values that
-// take turns 2 and a shorter wait (a silent one costs about 2 x 250 ms when its turn comes).
-const SILENT_STRIKES = 3;
-const ROTATING_STRIKES = 2;
+// How many silent reads in a row give a value up (SILENT_STRIKES for the every-cycle ones,
+// ROTATING_STRIKES for the ones that take turns), when an every-cycle value that did answer is
+// demoted to the rotation (DEMOTE_STRIKES) and how often a failed supported-PID read is tried
+// again (SUPPORTED_RETRY_CYCLES) are the polled-item set's (src/pollset.js, with the reason for
+// each number); the wait a rotating read gets for an answer is the recorder's own.
 const ROTATING_TIMEOUT_MS = 250;
-
-// An every-cycle value that did answer once but is silent this many reads in a row is not read
-// every cycle any more (each cycle would wait out 2 x 500 ms for it): it takes turns with the
-// rotating values, with their short wait, and goes back to every cycle when it answers again.
-const DEMOTE_STRIKES = 3;
 
 // When the every-cycle reads of a cycle took longer than max(1200 ms, 300 ms per every-cycle
 // value) the rotating read of that cycle is skipped: the ECU is slow or silent on something and
@@ -40,10 +36,6 @@ const DEMOTE_STRIKES = 3;
 // at a real read's ~190 ms take 1.5 s when all is well.)
 const SLOW_CYCLE_MS = 1200;
 const SLOW_CYCLE_MS_PER_VALUE = 300;
-
-// The supported-PID read, once it has failed, is tried again only every this many cycles (it is
-// 2 x 360 ms of waiting for nothing when the ECU is not answering PID 00).
-const SUPPORTED_RETRY_CYCLES = 10;
 
 const ENGINE_RUNNING_RPM = 400;
 const ENGINE_STOPPED_RPM = 100;
@@ -128,12 +120,12 @@ const csvCell = (v) => {
 
 const megabytes = (bytes) => (bytes >= 1048576 ? `${Math.round(bytes / 1048576)} MB` : `${bytes} bytes`);
 
-/** The reads of the bike description as items: { key, kind: 'gauge' | 'switch' | 'analog', def, id, gated }. */
+/** The reads of the bike description as polled items: { key, kind: 'gauge' | 'switch' | 'analog', def, id, pid, gated }. */
 function itemsOf(bike) {
   const items = [
-    ...bike.gauges.map((def) => ({ key: def.key, kind: 'gauge', def, id: def.id ?? null, gated: !!def.requiresUnlock })),
-    ...bike.switches.map((def) => ({ key: def.key, kind: 'switch', def, id: def.id, gated: !!bike.switchesRequireUnlock })),
-    ...bike.analogs.map((def) => ({ key: def.key, kind: 'analog', def, id: def.id, gated: def.requiresUnlock ?? true })),
+    ...bike.gauges.map((def) => ({ key: def.key, kind: 'gauge', def, id: def.id ?? null, pid: def.pid ?? null, gated: !!def.requiresUnlock })),
+    ...bike.switches.map((def) => ({ key: def.key, kind: 'switch', def, id: def.id, pid: null, gated: !!bike.switchesRequireUnlock })),
+    ...bike.analogs.map((def) => ({ key: def.key, kind: 'analog', def, id: def.id, pid: null, gated: def.requiresUnlock ?? true })),
   ];
   const keys = new Set();
   for (const it of items) {
@@ -172,6 +164,10 @@ async function readItem(session, item, timeout) {
  *
  * It is a LiveRun (see liverun.js): registered with the connection at creation, so a
  * disconnect or a lost ECU cancels it, and read errors are counted and the cycle goes on.
+ * The run's sample time (when the cycle started, ms since the start; `ctx.t`) is the `t_ms`
+ * of the sample and of its CSV row, and the run's graph history uses the same value. The CSV
+ * is a LogSink (src/logsink.js) owned by the run: opened as record-<time>.csv without ever
+ * overwriting an earlier one, capped at `maxBytes`, closed when the run ends.
  * The first cycle reads the ECU's list of supported PIDs; a gauge whose PID is not on it is not
  * available without being asked (if that read fails it is tried again every SUPPORTED_RETRY_CYCLES
  * cycles, not every cycle). Every cycle reads the values in EVERY_CYCLE (silence wait 500 ms);
@@ -218,26 +214,32 @@ class Recording extends LiveRun {
     const rawItems = items.filter((it) => it.id != null);
     const header = ['t_ms', 'cycle_ms', ...columns, ...rawItems.map((it) => `${it.key}_raw`), 'marker', 'event'];
 
+    // The polled-item set owns what is served, the strikes, the demotion, the rotation and the
+    // supported-PID bootstrap (src/pollset.js); the recorder reads and reports. A failed bootstrap
+    // is an error of the cycle, not the end of it, and is retried only every SUPPORTED_RETRY_CYCLES.
+    const set = pollset({
+      items,
+      every: critical.map((it) => it.key),
+      rotation: rotation.map((it) => it.key),
+      dropAfter: { every: SILENT_STRIKES, rotation: ROTATING_STRIKES },
+      demoteAfter: DEMOTE_STRIKES,
+      gate: () => svc.needsUnlock(conn) === null,
+      listSupported: svc.supportedPids,
+      supportedRetryCycles: SUPPORTED_RETRY_CYCLES,
+    });
     const st = {
-      startedAt: 0,
-      values: {}, // newest { value, bytes, text?, active?, at } per key
-      na: new Set(),
-      supported: null,
-      locked: [],
       cells: null,
       lastCycleMs: 0,
       maxCycleMs: 0,
-      supportedFailedAt: null, // the cycle the last failed supported-PID read was in
-      demoted: new Set(), // every-cycle keys that take turns for now
       skipped: 0, // cycles whose rotating read was skipped
     };
-    let turn = 0;
     const cells = () => [
       ...columns.map((k) => {
-        const v = byKey.get(k).kind === 'switch' ? st.values[k]?.active : st.values[k]?.value;
+        const s = set.value(k);
+        const v = byKey.get(k).kind === 'switch' ? s?.active : s?.value;
         return typeof v === 'boolean' ? Number(v) : v ?? '';
       }),
-      ...rawItems.map((it) => (st.values[it.key] ? hex(st.values[it.key].bytes) : '')),
+      ...rawItems.map((it) => (set.value(it.key) ? hex(set.value(it.key).bytes) : '')),
     ];
     const sampler = {
       name: 'record',
@@ -246,67 +248,42 @@ class Recording extends LiveRun {
       items,
       async sample(session, ctx) {
         const began = conn.clock.now();
-        const t_ms = began - st.startedAt;
-        if (!st.supported && (st.supportedFailedAt === null || ctx.cycle - st.supportedFailedAt >= SUPPORTED_RETRY_CYCLES)) {
-          try {
-            st.supported = await svc.supportedPids(session);
-            for (const it of items) if (it.kind === 'gauge' && it.def.pid != null && !st.supported.has(it.def.pid)) st.na.add(it.key);
-          } catch (e) {
-            st.supportedFailedAt = ctx.cycle; // asked again only after SUPPORTED_RETRY_CYCLES cycles
-            ctx.error(e);
-          }
-        }
-        const open = svc.needsUnlock(conn) === null;
-        st.locked = open ? [] : items.filter((it) => it.gated).map((it) => it.key);
-        const served = (it) => !st.na.has(it.key) && (open || !it.gated);
-        const every = critical.filter((it) => served(it) && !st.demoted.has(it.key));
-        const pool = [...rotation.filter(served), ...critical.filter((it) => served(it) && st.demoted.has(it.key))];
+        const t_ms = ctx.t;
+        const plan = await set.plan(session, ctx);
         const channels = {};
         const read = [];
         const readOne = async (it, rotating) => {
           try {
             const r = await readItem(session, it, rotating ? ROTATING_TIMEOUT_MS : undefined);
+            set.report(it.key, r && { ...r, at: ctx.cycle });
             if (r) {
-              it.answered = true;
-              it.strikes = 0;
-              st.demoted.delete(it.key);
-              st.values[it.key] = { ...r, at: ctx.cycle };
               channels[it.key] = r.value;
               read.push(it.key);
-              return;
-            }
-            it.strikes = (it.strikes ?? 0) + 1;
-            if (!it.answered) {
-              if (it.strikes >= (rotating ? ROTATING_STRIKES : SILENT_STRIKES)) st.na.add(it.key);
-            } else if (!rotating && it.strikes >= DEMOTE_STRIKES) {
-              st.demoted.add(it.key);
-              it.strikes = 0;
             }
           } catch (e) {
             ctx.error(e);
           }
         };
         const everyStart = conn.clock.now();
-        for (const it of every) {
+        for (const it of plan.every) {
           if (ctx.signal.aborted) break;
           await readOne(it, false);
         }
-        const skip = conn.clock.now() - everyStart > Math.max(SLOW_CYCLE_MS, SLOW_CYCLE_MS_PER_VALUE * every.length);
+        const skip = conn.clock.now() - everyStart > Math.max(SLOW_CYCLE_MS, SLOW_CYCLE_MS_PER_VALUE * plan.every.length);
         if (skip) {
           st.skipped++;
         } else {
-          for (let i = 0; i < Math.min(perCycle, pool.length); i++) {
+          for (const it of plan.turns(perCycle)) {
             if (ctx.signal.aborted) break;
-            await readOne(pool[turn++ % pool.length], true);
+            await readOne(it, true);
           }
         }
         st.cells = cells();
-        const v = (k) => st.values[k]?.value ?? null;
-        const flag = (k) => st.values[k]?.active ?? null;
+        const v = (k) => set.value(k)?.value ?? null;
+        const flag = (k) => set.value(k)?.active ?? null;
         st.lastCycleMs = conn.clock.now() - began;
         st.maxCycleMs = Math.max(st.maxCycleMs, st.lastCycleMs);
         return {
-          t_ms,
           cycleMs: st.lastCycleMs,
           skipped: skip,
           channels,
@@ -317,10 +294,11 @@ class Recording extends LiveRun {
       },
     };
 
-    super(conn, sampler, { name: 'record', interval });
-    st.startedAt = this.startedAt;
+    // The run owns the log: it opens record-<time>.csv with the header line, enforces the cap and
+    // reports a failed write as a fault. Rows and the closing row are this class's.
+    super(conn, sampler, { name: 'record', interval, logDir, logSpec: { prefix: 'record', header: header.map(csvCell).join(','), maxBytes } });
     this._st = st;
-    this._header = header;
+    this._set = set;
     this._blank = header.slice(2, -2).map(() => '');
     this.minutes = minutes;
     this.maxMs = minutes * 60_000;
@@ -328,65 +306,30 @@ class Recording extends LiveRun {
     this.events = [];
     this.markers = [];
     this.stopReason = null;
-    this.csvBytes = 0;
-    this.endedAt = null;
     this._pending = [];
     this._detector = new EventDetector();
-    this._csvFd = null;
     this._finished = false;
-    try {
-      fs.mkdirSync(logDir, { recursive: true });
-      const stamp = new Date(this.startedAt).toISOString().replace(/[:.]/g, '-');
-      for (let n = 1; this._csvFd === null; n++) {
-        const file = path.join(logDir, `record-${stamp}${n > 1 ? `-${n}` : ''}.csv`);
-        try {
-          this._csvFd = fs.openSync(file, 'wx'); // never over an earlier recording
-          this.csvPath = file;
-        } catch (e) {
-          if (e.code !== 'EEXIST' || n >= 99) throw e;
-        }
-      }
-      this._write(`${header.map(csvCell).join(',')}\n`);
-    } catch (e) {
-      this._closeCsv();
-      this._registration.cancel();
-      throw e;
-    }
     this.on('sample', (sample) => this._accept(sample));
-    this.on('end', () => {
-      this.endedAt = this.conn.clock.now();
-      queueMicrotask(() => this._finish()); // the connection marks itself 'lost' right after it cancels the runs
-    });
-  }
-
-  /** ms since the recording was created. */
-  get elapsedMs() {
-    return (this.endedAt ?? this.conn.clock.now()) - this.startedAt;
   }
 
   /** { min, max, last } of the battery voltage seen (null until read). */
   get battery() {
-    return { min: this.min.battery ?? null, max: this.max.battery ?? null, last: this._st.values.battery?.value ?? null };
-  }
-
-  /** True while the CSV file is open (it is closed as soon as the run has ended). */
-  get csvOpen() {
-    return this._csvFd !== null;
+    return { min: this.min.battery ?? null, max: this.max.battery ?? null, last: this._set.value('battery')?.value ?? null };
   }
 
   /** Keys of the values that need the ECU unlock and are not being read now. */
   get locked() {
-    return this._st.locked;
+    return this._set.view().locked;
   }
 
   /** Keys of the values the ECU does not serve (marked once, not asked again). */
   get notAvailable() {
-    return [...this._st.na];
+    return this._set.view().unsupported;
   }
 
   /** Keys of the every-cycle values that went silent after answering and now take turns (until they answer again). */
   get demoted() {
-    return [...this._st.demoted];
+    return this._set.view().demoted;
   }
 
   /** How many cycles had their rotating read skipped because the every-cycle reads were slow. */
@@ -403,7 +346,7 @@ class Recording extends LiveRun {
   mark(text) {
     const clean = String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
     if (!clean || !this.running) return null;
-    const marker = { t_ms: this.conn.clock.now() - this.startedAt, text: clean };
+    const marker = { t_ms: this.elapsedMs, text: clean };
     this._pending.push(marker);
     this.markers.push(marker);
     this.emit('mark', marker);
@@ -412,7 +355,7 @@ class Recording extends LiveRun {
 
   /** What a page shows, as plain data. */
   view() {
-    const v = this._st.values;
+    const v = this._set.view().values;
     return {
       running: this.running,
       outcome: this.outcome,
@@ -451,7 +394,7 @@ class Recording extends LiveRun {
     sample.events = this._detector.push(sample.snapshot);
     for (const text of sample.events) this._addEvent(sample.t_ms, text);
     this._writeRow(sample.t_ms, sample.cycleMs, sample.cells, sample.marker, sample.events.join('; '));
-    if (this.stopReason === null && this.conn.clock.now() - this.startedAt >= this.maxMs) {
+    if (this.stopReason === null && this.elapsedMs >= this.maxMs) {
       this._stop(`time limit of ${this.minutes} minute${this.minutes === 1 ? '' : 's'} reached`);
     }
   }
@@ -467,35 +410,24 @@ class Recording extends LiveRun {
     this.sampler.finished = true;
   }
 
+  _rowText(t_ms, cycleMs, cells, marker, event) {
+    return [t_ms, cycleMs, ...cells, marker, event].map(csvCell).join(',');
+  }
+
   _writeRow(t_ms, cycleMs, cells, marker, event) {
-    const line = [t_ms, cycleMs, ...cells, marker, event].map(csvCell).join(',');
-    this._write(`${line}\n`, true);
+    this._sink.row(this._rowText(t_ms, cycleMs, cells, marker, event));
+    this._noteCap();
   }
 
-  _write(text, isRow = false) {
-    if (this._csvFd === null) return;
-    const size = Buffer.byteLength(text);
-    if (isRow && this.csvBytes + size > this.maxBytes) {
-      if (this.stopReason === null) this._stop(`CSV size limit reached (${megabytes(this.maxBytes)}): recording stopped`);
-      return;
-    }
-    try {
-      fs.writeSync(this._csvFd, text);
-      this.csvBytes += size;
-    } catch (e) {
-      this._fail(new Error(`log write failed: ${e.message}`));
-      this._closeCsv();
-    }
+  /** A row the size limit refused ends the recording (once, with the message). */
+  _noteCap() {
+    if (this._sink.capped && this.stopReason === null) this._stop(`CSV size limit reached (${megabytes(this.maxBytes)}): recording stopped`);
   }
 
-  _closeCsv() {
-    if (this._csvFd === null) return;
-    try {
-      fs.closeSync(this._csvFd);
-    } catch {
-      // nothing more to do for a file that will not close
-    }
-    this._csvFd = null;
+  /** The run's log is not closed at once: the connection marks itself 'lost' right after it cancels the runs, and that gets a last row first. */
+  _endLog() {
+    if (!this._sink) return; // the log could not be opened: nothing to finish
+    queueMicrotask(() => this._finish());
   }
 
   /** After the run has ended: the connection loss and any marker still waiting get their row, then the file is closed. */
@@ -508,11 +440,13 @@ class Recording extends LiveRun {
       this._addEvent(t_ms, 'connection lost');
       this.stopReason ??= `connection lost: ${this.conn.error}`;
     }
+    let closing;
     if (lost || this._pending.length) {
       const marker = this._pending.splice(0).map((m) => m.text).join(' | ');
-      this._writeRow(t_ms, '', this._st.cells ?? this._blank, marker, lost ? 'connection lost' : '');
+      closing = this._rowText(t_ms, '', this._st.cells ?? this._blank, marker, lost ? 'connection lost' : '');
     }
-    this._closeCsv();
+    this._sink.close(closing);
+    this._noteCap();
   }
 }
 
@@ -521,6 +455,6 @@ function recordRun(conn, opts) {
 }
 
 module.exports = {
-  Recording, recordRun, EventDetector, EVERY_CYCLE, DEFAULT_MINUTES, DEFAULT_MAX_BYTES,
+  Recording, recordRun, EventDetector, EVERY_CYCLE,
   SILENT_STRIKES, ROTATING_STRIKES, ROTATING_TIMEOUT_MS, DEMOTE_STRIKES, SUPPORTED_RETRY_CYCLES,
 };

@@ -23,6 +23,14 @@ test('frame building matches the frames the tool sends', async () => {
   const sent = t.events.find((e) => e.type === 'write' && e.baud === 10400).bytes;
   assert.deepEqual(kit.buildFrame(0x80, 0xd5, 0xf5, [0x81]), sent);
   assert.deepEqual(kit.buildFrame(0xc0, 0x33, 0xf1, [0x81]), [0xc1, 0x33, 0xf1, 0x81, 0x66]);
+  // the same function the session builds its requests with, so a probe cannot drift from the tool
+  const { addressedFrame, checksum } = require('../src/kwp');
+  assert.equal(kit.buildFrame, addressedFrame);
+  assert.equal(kit.checksum, checksum);
+  const long = Array.from({ length: 64 }, (_, i) => i);
+  const frame = kit.buildFrame(0x80, 0x11, 0xf1, long);
+  assert.deepEqual(frame.slice(0, 4), [0x80, 0x11, 0xf1, 64], 'data over 63 bytes gets a separate length byte');
+  assert.equal(frame.at(-1), checksum(frame.slice(0, -1)));
   assert.deepEqual(kit.withChecksum([0x72, 0x05, 0x00, 0xf0], { twosComplement: true }), [0x72, 0x05, 0x00, 0xf0, 0x99]);
   assert.equal(kit.hex([]), '(nothing)');
   assert.equal(kit.hex([0x0a, 0xff]), '0a ff');

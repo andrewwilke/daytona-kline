@@ -2,6 +2,7 @@
 'use strict';
 
 const fs = require('fs');
+const path = require('path');
 const readline = require('readline');
 const { SerialTransport } = require('./src/transport');
 const { hex } = require('./src/kwp');
@@ -11,6 +12,9 @@ const { blockRun, gaugeRun, switchRun, probeRun } = require('./src/liverun');
 const { recordRun } = require('./src/recorder');
 const { discoverRun, takeSnapshot, DEFAULT_FROM, DEFAULT_TO, EXTENDED_FROM, EXTENDED_TO } = require('./src/discover');
 const { DEFAULT_BIKE } = require('./src/bikes');
+const { SWITCHES_NOTE } = require('./src/runs');
+const { DEFAULT_LOG_DIR } = require('./src/logsink');
+const { idText, hexNum, hex0x } = require('./src/format');
 const outputtests = require('./src/outputtests');
 
 function parseArgs(argv) {
@@ -53,7 +57,14 @@ let waitForEnter = (prompt) => new Promise((resolve) => {
   rl.question(prompt, () => rl.close());
 });
 
-let makeConnection = (args) => new Connection({ debug: !!args.debug, autoUnlock: !args['no-unlock'] });
+/**
+ * The one place the CLI chooses its bike. Some commands need the bike before (or without) any connection
+ * (`outputtest list`, a refusal before anything is sent), so the connection is built with this very bike:
+ * once connected a command reads `conn.bike`, which is the same description by construction.
+ */
+const cliBike = () => DEFAULT_BIKE;
+
+let makeConnection = (args) => new Connection({ bike: cliBike(), debug: !!args.debug, autoUnlock: !args['no-unlock'] });
 
 /** The one line saying how the ECU unlock stands (src/unlock.js), printed after connecting. */
 function unlockLine(conn) {
@@ -102,7 +113,8 @@ const cyclesFlag = (args) => (args.cycles ? parseInt(args.cycles, 10) : Infinity
 /**
  * Render each sample of `run` until it ends. Read errors are tolerated (the
  * connection decides when the ECU is lost) unless the very first reads all
- * fail, which means the request itself is wrong.
+ * fail, which means the request itself is wrong (the run's own rule,
+ * `failingFromStart`, shared with the GUI's sensor block read).
  */
 async function follow(conn, run, render, cycles = Infinity) {
   run.on('sample', render);
@@ -110,7 +122,7 @@ async function follow(conn, run, render, cycles = Infinity) {
     if (run.cycles >= cycles) run.stop();
   });
   run.on('fault', () => {
-    if (!run.samples && run.errors >= 3) run.stop();
+    if (run.failingFromStart) run.stop();
   });
   await run.start();
   endedEarly(conn);
@@ -162,7 +174,7 @@ function gaugeLines(run) {
     else if (v) shown = d.type === 'text' ? v.text : d.type === 'bitpos' ? String(v.value || 'N').padStart(8) : `${String(v.value).padStart(8)} ${d.unit}`.trimEnd();
     return `${d.label.padEnd(22)} ${shown}${v && !d.verified && !unsupported.includes(d.key) ? ' ?' : ''}`;
   });
-  const pids = supported ? `   ECU serves PIDs: ${[...supported].sort((a, b) => a - b).map((p) => p.toString(16).padStart(2, '0')).join(' ')}` : '';
+  const pids = supported ? `   ECU serves PIDs: ${[...supported].sort((a, b) => a - b).map((p) => hexNum(p)).join(' ')}` : '';
   lines.push(`cycle ${run.cycles}${pids}${errorNote(run)}`);
   return lines;
 }
@@ -175,7 +187,6 @@ function loadMap(args, conn) {
 const blockIdFlag = (args) => (args.id ? parseInt(args.id, 16) : undefined);
 
 const logDirFlag = (args) => (typeof args['log-dir'] === 'string' ? args['log-dir'] : undefined);
-const idText = (id) => `0x${id.toString(16).padStart(4, '0')}`;
 
 /** The --from / --to flags (hex ids, default 0..ff; --extended: 100..3ff) as [from, to]. */
 function idRange(args) {
@@ -238,11 +249,11 @@ function printDiscovered(v) {
 const RAW_SEND_SERVICES = new Set([0x01, 0x02, 0x03, 0x07, 0x09, 0x18, 0x1a, 0x21, 0x22, 0x3e]);
 
 function rawSendRefusal(service) {
-  const hexService = `0x${service.toString(16).padStart(2, '0')}`;
+  const hexService = hex0x(service);
   if (RAW_SEND_SERVICES.has(service)) return null;
   const pointer = service === 0x04 || service === 0x14 ? 'cleardtc --yes erases codes'
     : 'output tests are only run by the outputtest command, from its whitelist';
-  return `send only sends reads (services ${[...RAW_SEND_SERVICES].map((n) => n.toString(16).padStart(2, '0')).join(' ')}); service ${hexService} is refused and nothing was sent (${pointer}; the unlock is done by the tool itself)`;
+  return `send only sends reads (services ${[...RAW_SEND_SERVICES].map((n) => hexNum(n)).join(' ')}); service ${hexService} is refused and nothing was sent (${pointer}; the unlock is done by the tool itself)`;
 }
 
 /** The whitelist as lines: key, name, what you should see, the safety note. */
@@ -288,11 +299,11 @@ const COMMANDS = {
         // serving data; harmless if refused.
         console.log(conn.diagSession
           ? 'Manufacturer diagnostic session started (10 80 accepted).'
-          : 'Diagnostic session request refused � plain session is fine for reads.');
+          : 'Diagnostic session request refused; a plain session is fine for reads.');
       } else {
         console.log('ISO 9141-2 OBD-II session: live data and fault codes use the standard modes 01 and 03.');
       }
-      console.log('Saved to config.json � future commands will use this automatically.');
+      console.log('Saved to config.json; future commands will use this automatically.');
     });
   },
 
@@ -315,7 +326,7 @@ const COMMANDS = {
       console.log(svc.faultSummary(result));
       console.log(`\nFault codes read: ${count}`);
       for (const d of dtcs) {
-        const byte = d.statusByte == null ? '' : ` 0x${d.statusByte.toString(16).padStart(2, '0')}`;
+        const byte = d.statusByte == null ? '' : ` ${hex0x(d.statusByte)}`;
         console.log(`  ${d.code}  (${d.status}${byte})${d.description ? '  ' + d.description : ''}`);
       }
       if (pendingSupported === false) console.log('\nPending codes (mode 07): not supported by this ECU.');
@@ -364,13 +375,13 @@ const COMMANDS = {
       const to = args.to ? parseInt(args.to, 16) : 0xff;
       const run = probeRun(conn, { from, to });
       console.log(`Advanced: probing readDataByLocalIdentifier 0x${from.toString(16)}..0x${to.toString(16)} (read-only)...`);
-      await follow(conn, run, ({ id }) => process.stderr.write(`\r  0x${id.toString(16).padStart(2, '0')} `));
+      await follow(conn, run, ({ id }) => process.stderr.write(`\r  ${hex0x(id)} `));
       process.stderr.write('\r');
       if (run.sampler.blocked) return console.log(`\nProbe stopped early: ${run.sampler.blocked}.`);
       const { found, biggest } = run.sampler;
       console.log(`\nSupported data blocks: ${found.length}`);
       for (const f of found) {
-        console.log(`  id 0x${f.id.toString(16).padStart(2, '0')}  ${f.length} bytes: ${f.hex}`);
+        console.log(`  id ${hex0x(f.id)}  ${f.length} bytes: ${f.hex}`);
       }
       if (biggest) {
         console.log(`\nBiggest block is id 0x${biggest.id.toString(16)} — that's almost certainly the live sensor block.`);
@@ -410,7 +421,7 @@ const COMMANDS = {
       await follow(conn, run, ({ data }) => {
         let out = '';
         for (let i = 0; i < data.length; i++) {
-          const cell = data[i].toString(16).padStart(2, '0');
+          const cell = hexNum(data[i]);
           out += run.min[i] !== run.max[i] ? `\x1b[1;33m${cell}\x1b[0m` : cell;
           out += (i + 1) % 4 === 0 ? '  ' : ' ';
           if ((i + 1) % 16 === 0) out += '\n';
@@ -426,8 +437,8 @@ const COMMANDS = {
 
   async switches(args) {
     const ids = typeof args.ids === 'string' ? args.ids.split(',').map((s) => parseInt(s, 16)) : null;
-    if (!ids && !DEFAULT_BIKE.switchIds.length) {
-      console.log('This bike description names no switch IDs. Advanced: name IDs to try with --ids 41,60 (hex).');
+    if (!ids && !cliBike().switchIds.length) {
+      console.log(`${SWITCHES_NOTE} Advanced: name IDs to try with --ids 41,60 (hex).`);
       return;
     }
     await withEcu(args, (conn) => advanced(conn, 'switches', async () => {
@@ -527,7 +538,7 @@ const COMMANDS = {
 
   async outputtest(args) {
     const key = args._[0];
-    const bike = DEFAULT_BIKE;
+    const bike = cliBike(); // nothing is connected yet for list, the description or a refusal
     if (key === 'list') {
       console.log('Output tests this tool can run (the complete list; nothing else is ever commanded):');
       console.log();
@@ -645,7 +656,7 @@ Optional, makes the bike move or run parts (needs the ECU unlock; see "Output te
 
 Common options: --port COMx  --kind slow|fast  --target 33  --init baud|break  --debug
                 --no-unlock  do not try the ECU unlock after connecting
-                --log-dir <folder>  where record and discover write (default: logs)
+                --log-dir <folder>  where record and discover write (default: ${path.basename(DEFAULT_LOG_DIR)})
 gauges, watch, live and switches also take --interval <ms> between reads and --cycles <n> to stop after n readings`);
     return;
   }

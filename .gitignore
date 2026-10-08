@@ -7,7 +7,14 @@ logs/
 *.csv
 
 # Your own ECU unlock number: never commit or share (unlock.example.json is the tracked placeholder)
-unlock.json
+unlock*.json
+!unlock.example.json
+
+# Other secrets, as a safety net
+.env
+.env.*
+*.pem
+*.key
 
 # Editor and OS junk
 .vscode/
@@ -17,4 +24,10 @@ unlock.json
 .DS_Store
 Thumbs.db
 desktop.ini
-.claude/settings.local.json
+# Tool and sync folders of the person working on it
+.claude/
+.stfolder/
+.stignore
+*.sync-conflict-*
+*.log
+npm-debug.log*

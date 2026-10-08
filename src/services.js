@@ -1,6 +1,7 @@
 'use strict';
 
 const { KwpError, KwpNegativeResponse, FAILURE, SVC, hex } = require('./kwp');
+const { idText } = require('./format');
 
 const MODE = { LIVE_DATA: 0x01, STORED_DTCS: 0x03, CLEAR_DTCS: 0x04, PENDING_DTCS: 0x07 };
 
@@ -13,7 +14,15 @@ const round2 = (n) => Math.round(n * 100) / 100;
 // On an ISO 9141 session the 0x22 reads (switches, battery, gear), the sensor
 // block, its probe and the ECU identity are refused until the connection is
 // unlocked (src/unlock.js). The gate reads the connection's own unlock state;
-// it never guesses from a refusal. Other session styles are not gated.
+// it never guesses from a refusal. Other session styles are not gated (and a
+// connection with no session has nothing to gate: callers ask for the session
+// first and fail as "not connected").
+//
+// needsUnlock is the one predicate. requireUnlock, lockedGauges and
+// outputtests.unlockProblem are derived from it and cannot disagree with it:
+// the only difference is that unlockProblem asks for `strict`, because an
+// output test is a command, not a read, and wants the ECU actually unlocked
+// whatever the session style.
 
 class NeedsUnlockError extends Error {
   constructor(why) {
@@ -22,11 +31,20 @@ class NeedsUnlockError extends Error {
   }
 }
 
-/** null when gated reads may go ahead on `conn`, else a one-line reason: "needs the ECU unlock, not available (why)". */
-function needsUnlock(conn) {
-  if (conn.style !== 'iso9141' || conn.unlockState === 'unlocked') return null;
+/** Is `conn` a connected session of a style that is not gated (anything but ISO 9141)? */
+const ungatedStyle = (conn) => conn.style != null && conn.style !== 'iso9141';
+
+/**
+ * null when gated reads may go ahead on `conn`, else a one-line reason: "needs the ECU unlock, not available (why)".
+ * Gated reads go ahead when the connection is unlocked or its session is not ISO 9141. With
+ * `strict` the session style gives no exemption: only an unlocked connection passes (for commands).
+ */
+function needsUnlock(conn, { strict = false } = {}) {
+  if (conn.unlockState === 'unlocked') return null;
+  if (!strict && conn.style !== 'iso9141') return null;
   const why = {
-    unavailable: 'unlock is off: no unlock.json',
+    // Off on a non-ISO session means the connection said so itself (see Connection._autoUnlock): its words are better than "no unlock.json".
+    unavailable: ungatedStyle(conn) ? conn.unlockReason ?? 'unlock is off' : 'unlock is off: no unlock.json',
     invalid: conn.unlockReason,
     locked: 'not unlocked yet',
     unlocking: 'unlock in progress',
@@ -41,9 +59,13 @@ function requireUnlock(conn) {
   if (why) throw new NeedsUnlockError(why);
 }
 
-/** Keys of the gauges in `defs` that are not read now: they need the unlock and `conn` is not unlocked. */
+/**
+ * Keys of the gauges in `defs` that are not read now: they need the unlock and the gate (needsUnlock) is
+ * closed. With no session yet (the dashboard before connecting) the gate is asked strictly, so the
+ * unlock-only dials say they wait for the unlock rather than looking readable.
+ */
 function lockedGauges(conn, defs = conn.bike.gauges) {
-  return conn.unlockState === 'unlocked' ? [] : defs.filter((d) => d.requiresUnlock).map((d) => d.key);
+  return needsUnlock(conn, { strict: conn.style == null }) === null ? [] : defs.filter((d) => d.requiresUnlock).map((d) => d.key);
 }
 
 // ---- Mode 01 (SAE J1979 live data) ---------------------------------------
@@ -190,13 +212,8 @@ async function readGauge(session, def, { timeout } = {}) {
     const bytes = await readPid(session, def.pid, { timeout });
     return bytes ? decodeGauge(def, bytes) : null;
   }
-  try {
-    const bytes = await readCommonId(session, def.id, { timeout: timeout ?? 600 });
-    return bytes.length ? decodeGauge(def, bytes) : null;
-  } catch (e) {
-    if (e instanceof KwpNegativeResponse) return null;
-    throw e;
-  }
+  const { bytes } = await askId(session, def.id, { timeout: timeout ?? 600, allowSilence: false });
+  return bytes?.length ? decodeGauge(def, bytes) : null;
 }
 
 // ---- Fault codes -----------------------------------------------------------
@@ -376,7 +393,9 @@ async function probeLocalId(session, id) {
 /**
  * Probe readDataByLocalIdentifier across all 255 ids to find which blocks
  * this ECU serves (read-only service; unsupported ids just return a
- * negative response).
+ * negative response). Nothing in the tool itself calls this any more (the
+ * probe run in liverun.js asks one id per cycle with probeLocalId); it is
+ * kept only because test/connection.test.js drives a cancelled run with it.
  */
 async function probeLocalIds(session, { from = 0x01, to = 0xff, onProgress, signal } = {}) {
   const found = [];
@@ -395,11 +414,50 @@ async function readLocalId(session, id, { timeout = 1200 } = {}) {
 
 /**
  * readDataByCommonIdentifier (0x22): some ECUs serve each sensor and switch
- * under its own 2-byte ID. Returns the value bytes.
+ * under its own 2-byte ID. Returns the value bytes. The strict read: a refusal
+ * throws KwpNegativeResponse and silence throws a timeout, unless `allowSilence`.
+ * The tolerant reads (readIdBytes, readSwitches, readAnalog, probeCommonId) all go
+ * through askId instead.
  */
 async function readCommonId(session, id, { timeout = 800, allowSilence = false, retries = 0, background = false } = {}) {
   const { payload } = await session.request([0x22, (id >> 8) & 0xff, id & 0xff], { timeout, retries, allowSilence, background });
   return payload.slice(3); // strip 0x62 <id hi> <id lo>
+}
+
+/**
+ * The one place that decides what "the ECU does not serve this 0x22 id" means.
+ * Sends `22 hi lo` (resent `retries` times on silence, 0 by default) and says
+ * what came back, as
+ *   { payload, bytes, why: null }     the ECU answered: its whole reply and the data bytes after 62 hi lo
+ *   { payload: null, bytes: null, why: 'refused' }   a negative response (7F)
+ *   { payload: null, bytes: null, why: 'silent' }    no reply at all
+ * Silence is "not served" only with `allowSilence` (the default), and then it
+ * does not count against the link; without it silence is a failing link and
+ * throws, as does anything else that is not a refusal (bad checksum, cut-off
+ * echo). Callers decide what a refusal or silence means to them; they never
+ * catch the errors themselves. `timeout` is the request's own default if omitted.
+ */
+async function askId(session, id, { timeout, retries = 0, allowSilence = true, background = false } = {}) {
+  try {
+    const { payload } = await session.request([0x22, (id >> 8) & 0xff, id & 0xff], { timeout, retries, allowSilence, background });
+    return { payload, bytes: payload.slice(3), why: null };
+  } catch (e) {
+    if (e instanceof KwpNegativeResponse) return { payload: null, bytes: null, why: 'refused' };
+    if (allowSilence && e instanceof KwpError && e.kind === FAILURE.TIMEOUT) return { payload: null, bytes: null, why: 'silent' };
+    throw e;
+  }
+}
+
+// A background read (the switch watcher's) must not hold the one K-line for long: a silent id costs the
+// whole wait, and the dashboard's reads queue behind it. So its wait is short, and the "ask once more"
+// for an id the ECU ignored is a separate request that goes back to the end of the queue, not a resend
+// inside the first one.
+const BACKGROUND_ID_TIMEOUT_MS = 350;
+
+async function askIdInBackground(session, id) {
+  const ask = () => askId(session, id, { timeout: BACKGROUND_ID_TIMEOUT_MS, retries: 0, background: true });
+  const first = await ask();
+  return first.why === 'silent' ? ask() : first;
 }
 
 /**
@@ -410,14 +468,14 @@ async function readCommonId(session, id, { timeout = 800, allowSilence = false, 
 async function readSwitches(session, ids, { background = false } = {}) {
   const out = [];
   for (const id of ids) {
-    try {
-      // The ECU now and then ignores a request it would normally answer: ask once more before calling it silent.
-      const v = await readCommonId(session, id, { allowSilence: true, retries: 1, background });
-      out.push({ id, value: v.length ? v.reduce((a, b) => a * 256 + b, 0) : null, hex: hex(v), bytes: [...v] });
-    } catch (e) {
-      if (!notServed(e)) throw e;
+    // The ECU now and then ignores a request it would normally answer: ask once more before calling it silent.
+    const { bytes } = background ? await askIdInBackground(session, id) : await askId(session, id, { timeout: 800, retries: 1 });
+    if (!bytes) {
       out.push({ id, value: null, hex: 'n/a', bytes: [] });
+      continue;
     }
+    const v = [...bytes];
+    out.push({ id, value: v.length ? v.reduce((a, b) => a * 256 + b, 0) : null, hex: hex(v), bytes: v });
   }
   return out;
 }
@@ -428,12 +486,8 @@ async function readSwitches(session, ids, { background = false } = {}) {
  * Resent `retries` times on silence (0 by default); silence never counts against the link.
  */
 async function readIdBytes(session, id, { timeout = 500, retries = 0, background = false } = {}) {
-  try {
-    return [...(await readCommonId(session, id, { timeout, allowSilence: true, retries, background }))];
-  } catch (e) {
-    if (notServed(e)) return null;
-    throw e;
-  }
+  const { bytes } = await askId(session, id, { timeout, retries, background });
+  return bytes ? [...bytes] : null;
 }
 
 // ---- Switches (0x22 ids with two data bytes) -----------------------------------
@@ -467,7 +521,7 @@ function describeSwitch(def, id, bytes) {
     id,
     key: def?.key ?? null,
     named: !!def,
-    name: def?.name ?? `ID 0x${id.toString(16).padStart(4, '0')}`,
+    name: def?.name ?? `ID ${idText(id)}`,
     inverted: !!def?.inverted,
     confirmation: def?.confirmation ?? null,
     evidence: def?.evidence ?? null,
@@ -495,7 +549,8 @@ function switchTiles(bike, rows) {
 
 /** Read and decode one of the bike's `analogs` (a voltage on a 0x22 id): { value, raw, hex } or null if not served. */
 async function readAnalog(session, def, { timeout, background = false } = {}) {
-  const bytes = await readIdBytes(session, def.id, { timeout, retries: 1, background });
+  const read = background ? await askIdInBackground(session, def.id) : { bytes: await readIdBytes(session, def.id, { timeout, retries: 1 }) };
+  const bytes = read.bytes ? [...read.bytes] : null;
   if (!bytes || !bytes.length) return null;
   return { ...decodeGauge(def, bytes), hex: hex(bytes) };
 }
@@ -525,16 +580,11 @@ function knownIds(bike) {
  * Sends nothing but 22 hi lo, once.
  */
 async function probeCommonId(session, id, { timeout = 300 } = {}) {
-  try {
-    const { payload } = await session.request([0x22, (id >> 8) & 0xff, id & 0xff], { timeout, retries: 0, allowSilence: true });
-    if (payload[1] !== ((id >> 8) & 0xff) || payload[2] !== (id & 0xff)) throw new Error(`reply [${hex(payload)}] is not for id 0x${id.toString(16)}`);
-    const bytes = payload.slice(3);
-    return { hit: { id, bytes, hex: hex(bytes), value: bytes.length ? bytes.reduce((a, b) => a * 256 + b, 0) : null }, why: null };
-  } catch (e) {
-    if (e instanceof KwpNegativeResponse) return { hit: null, why: 'refused' };
-    if (e instanceof KwpError && e.kind === FAILURE.TIMEOUT) return { hit: null, why: 'silent' };
-    throw e;
-  }
+  const { payload, bytes, why } = await askId(session, id, { timeout });
+  if (why) return { hit: null, why };
+  // A sweep reads many ids in a row, so a reply that is for another id would be taken as this one's value: refuse it.
+  if (payload[1] !== ((id >> 8) & 0xff) || payload[2] !== (id & 0xff)) throw new Error(`reply [${hex(payload)}] is not for id 0x${id.toString(16)}`);
+  return { hit: { id, bytes, hex: hex(bytes), value: bytes.length ? bytes.reduce((a, b) => a * 256 + b, 0) : null }, why: null };
 }
 
 /**

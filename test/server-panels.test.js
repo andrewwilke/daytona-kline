@@ -218,7 +218,9 @@ test('the record routes: start, a marker on the next sample, the live view, stop
   await new Promise((r) => setImmediate(r));
   const rows = fs.readFileSync(v.csvPath, 'utf8').trim().split('\n');
   assert.ok(rows.some((row) => row.includes(',Cranking,')), 'the marker is in the CSV');
-  assert.deepEqual(conn.runs, []);
+  assert.deepEqual(conn.runs, ['gauges'], 'the dashboard that yielded to the recording comes back when it ends');
+  assert.equal(state.gauges.running, true);
+  await call('POST /api/gauges/stop');
   await assert.rejects(() => call('POST /api/record/mark', { text: 'late' }), /not recording/);
   await call('POST /api/disconnect');
   state.logDir = undefined;

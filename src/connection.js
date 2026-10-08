@@ -105,8 +105,6 @@ class Connection extends EventEmitter {
     this._runs = new Map();
     this._keepAlive = null;
     this._connecting = null;
-    this._hold = null; // while set, requests other than the unlock's own wait: { done: Promise }
-    this._rawRequest = null; // the session's own request(), not held back
     this.unlockState = 'unavailable';
     this.unlockReason = null;
     this._resetUnlock();
@@ -261,7 +259,6 @@ class Connection extends EventEmitter {
         transport, port, kind: r.kind, style: r.style, target: r.target, source: r.source, addrMode: r.addrMode,
         keyBytes: r.keyBytes, diagSession: diag, _session: r.session,
       });
-      this._holdDuringUnlock(r.session);
       this._startKeepAlive(r.session);
       this._setState('connected', null);
       this._emit({ step: 'connected', ...this.info(), saved: r.saved });
@@ -304,19 +301,9 @@ class Connection extends EventEmitter {
   _clearSessionFields() {
     Object.assign(this, {
       transport: null, port: null, kind: null, style: null, target: null, source: null, addrMode: null,
-      keyBytes: null, diagSession: false, _session: null, _rawRequest: null,
+      keyBytes: null, diagSession: false, _session: null,
     });
     this._resetUnlock();
-  }
-
-  /** Make `session.request` wait while an unlock attempt holds the session (see _attemptUnlock). */
-  _holdDuringUnlock(session) {
-    const send = session.request.bind(session);
-    this._rawRequest = send;
-    session.request = async (data, opts) => {
-      while (this._hold && this._session === session) await this._hold.done;
-      return send(data, opts);
-    };
   }
 
   _unlockFile() {
@@ -355,18 +342,16 @@ class Connection extends EventEmitter {
       return;
     }
     // Requests already queued go first; anything new waits until the key is answered.
-    let release;
-    this._hold = { done: new Promise((r) => (release = r)) };
+    const hold = session.hold();
     this._setUnlock('unlocking');
     let outcome;
     try {
-      await unlockSession({ style: session.style, request: this._rawRequest }, multiplier);
+      await unlockSession({ style: session.style, request: hold.request }, multiplier);
       outcome = ['unlocked'];
     } catch (e) {
       outcome = ['failed', e.message];
     } finally {
-      this._hold = null;
-      release();
+      hold.release();
     }
     if (this._session === session && this.state === 'connected') this._setUnlock(...outcome);
   }

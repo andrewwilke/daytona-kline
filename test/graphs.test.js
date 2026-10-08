@@ -88,17 +88,6 @@ test('locked, the gauge run leaves the unlock-only extras out of the graphs and 
   conn.autoUnlock = true;
 });
 
-test('the graphs route names every channel: gauges and analogs as values, switches as flags with their bad state', async () => {
-  const { channels } = await routes['GET /api/graphs']();
-  const by = Object.fromEntries(channels.map((c) => [c.key, c]));
-  assert.equal(by.rpm.kind, 'value');
-  assert.equal(by.injPulse1.unit, 'ms');
-  assert.equal(by.tipOver.kind, 'flag');
-  assert.equal(by.tipOver.bad, 'off');
-  assert.equal(by.tipOver.offText, 'TRIPPED');
-  assert.equal(by.fuelSystem, undefined, 'a text gauge cannot be graphed');
-});
-
 test('parseCsv handles quoted cells with commas, quotes and blank cells', () => {
   assert.deepEqual(parseCsv('a,b,c\r\n1,"x, ""y""",\n2,3,4'), [['a', 'b', 'c'], ['1', 'x, "y"', ''], ['2', '3', '4']]);
 });

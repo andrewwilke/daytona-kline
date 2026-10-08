@@ -3,7 +3,8 @@
 const fs = require('fs');
 const path = require('path');
 
-const DEFAULT_LOG_DIR = path.join(__dirname, '..', 'logs');
+const { DEFAULT_LOG_DIR } = require('./logsink');
+
 const NAME_RE = /^record-[A-Za-z0-9._-]+\.csv$/; // what the recorder writes; keeps a page from asking for any other file
 
 /** Splits CSV text into rows of cells (quoted cells may hold commas, quotes and line breaks). */
@@ -96,4 +97,4 @@ function loadRecording(name, logDir = DEFAULT_LOG_DIR) {
   return { name, durationMs, series, events, markers };
 }
 
-module.exports = { listRecordings, loadRecording, parseCsv, NAME_RE };
+module.exports = { listRecordings, loadRecording, parseCsv };

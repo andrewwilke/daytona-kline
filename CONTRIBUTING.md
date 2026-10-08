@@ -51,6 +51,31 @@ name an id that has only been seen answering (the "Find more IDs" snapshots show
 when you operate something: do that first). Read-only applies here too: a table names ids to
 read, never anything to send.
 
+## Where things live
+
+A module has a small interface and a lot behind it; change behaviour in the one place that owns
+it and test it through the interface its callers use. The longer description is "How it works" in
+the README; in short:
+
+- `src/kwp.js` the session on the K-line, including the line lock (one request at a time, a
+  background priority, `hold()` for the unlock). `src/wakeup.js` wakes the ECU, `src/connection.js`
+  turns a port name into a ready session and keeps it alive, `src/unlock.js` is the security access.
+- `src/liverun.js` what a run is (sample time, CSV through `src/logsink.js`); `src/pollset.js` the
+  "drop what never answers, rotate the rest" policy the dashboard, switch watcher and recorder share;
+  `src/recorder.js` and `src/discover.js` are runs too.
+- `src/runs.js` the run coordinator: who may use the K-line (exclusive runs, background runs that
+  yield and come back, the owner's Stop). Start policy goes there, not in `server.js` or the page.
+- `server.js` only routes (and serves `public/index.html` and `public/js/<name>.js`, nothing
+  else); `cli.js` only renders. Neither keeps run state of its own.
+- `public/js/` the page: `app.js` draws, and `graphstore.js`, `fuelmap.js` and `session.js` hold the
+  logic without a DOM, loadable with `require()`, so `test/page-*.test.js` cross the interface the
+  page uses.
+- `src/bikes/` everything specific to one bike; `src/format.js` and `src/clock.js` small shared helpers.
+  A helper that exists already (hex text, `DEFAULT_LOG_DIR`, the frame checksum) is imported, not
+  written again; `test/logsink.test.js` and `test/format.test.js` check that.
+
+`CONTEXT.md` explains the words used here (session, gauge run, polled-item set, ...).
+
 ## Running the tests
 
 ```bash

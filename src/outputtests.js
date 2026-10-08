@@ -5,8 +5,8 @@ const path = require('path');
 const { EventEmitter } = require('events');
 const { KwpError, KwpNegativeResponse, FAILURE, hex } = require('./kwp');
 const svc = require('./services');
-
-const DEFAULT_LOG_DIR = path.join(__dirname, '..', 'logs');
+const { DEFAULT_LOG_DIR } = require('./logsink');
+const { hex0x } = require('./format');
 
 // The only two requests in this tool that make the ECU drive something. They are
 // built here and nowhere else (test/outputtests.test.js greps the source tree for
@@ -40,7 +40,6 @@ class OutputTestError extends Error {
   }
 }
 
-const hex2 = (n) => `0x${n.toString(16).padStart(2, '0')}`;
 const iso = (ms) => new Date(ms).toISOString();
 const seconds = (ms) => `${(ms / 1000).toFixed(1)} s`;
 
@@ -55,10 +54,13 @@ function findTest(bike, key) {
   return typeof key === 'string' ? (bike.outputTests ?? []).find((t) => t.key === key) : undefined;
 }
 
-/** null when the connection is unlocked, else "needs the ECU unlock, not available (why)". */
+/**
+ * null when the connection is unlocked, else "needs the ECU unlock, not available (why)". This is the
+ * services gate (svc.needsUnlock) asked strictly: a test is a command, so a session style that is not
+ * gated for reads still has to be unlocked.
+ */
 function unlockProblem(conn) {
-  if (conn.unlockState === 'unlocked') return null;
-  return svc.needsUnlock(conn) ?? `needs the ECU unlock, not available (${conn.unlockReason ?? `unlock is ${conn.unlockState}`})`;
+  return svc.needsUnlock(conn, { strict: true });
 }
 
 const controllers = new WeakMap();
@@ -212,7 +214,7 @@ class OutputTest extends EventEmitter {
   }
 
   _log(text) {
-    const r = appendLog(this.conn, this.logDir, `${iso(this.conn.clock.now())}  ${this.def.name} (routine ${hex2(this.def.routine)}, ${this.def.confirmation})  ${text}`);
+    const r = appendLog(this.conn, this.logDir, `${iso(this.conn.clock.now())}  ${this.def.name} (routine ${hex0x(this.def.routine)}, ${this.def.confirmation})  ${text}`);
     this.logFile ??= r.file;
     if (r.error) this.logError = r.error;
   }
@@ -235,7 +237,7 @@ class OutputTest extends EventEmitter {
     } catch (e) {
       if (e instanceof KwpNegativeResponse) {
         const why = e.code === 0x36 ? ' (the ECU is locked)' : '';
-        this._fail('refused-by-ecu', `the ECU refused the test (negative response, code ${hex2(e.code)})${why}`, { code: e.code });
+        this._fail('refused-by-ecu', `the ECU refused the test (negative response, code ${hex0x(e.code)})${why}`, { code: e.code });
       } else if (e instanceof KwpError && e.kind === FAILURE.TIMEOUT) {
         this._fail('no-answer', 'no answer from the ECU (the test was sent once and is not resent)');
       } else {
@@ -354,7 +356,7 @@ class OutputTest extends EventEmitter {
 async function runOutputTest(conn, key, { confirmed = false, logDir = DEFAULT_LOG_DIR } = {}) {
   const controller = controllerOf(conn);
   const def = findTest(conn.bike, key);
-  const what = def ? `${def.name} (routine ${hex2(def.routine)})` : `unknown test ${JSON.stringify(String(key))}`;
+  const what = def ? `${def.name} (routine ${hex0x(def.routine)})` : `unknown test ${JSON.stringify(String(key))}`;
   const refuse = (kind, message) => {
     appendLog(conn, logDir, `${iso(conn.clock.now())}  ${what}  REFUSED (${kind}): ${message}`);
     throw new OutputTestError(kind, message);
@@ -435,6 +437,4 @@ module.exports = {
   WATCH_MS,
   WATCH_STOP_MS,
   COOLDOWN_MS,
-  BATTERY_MIN_V,
-  BATTERY_WARN_V,
 };

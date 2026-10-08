@@ -45,7 +45,21 @@ const FAILURE = Object.freeze({
 const LINK_FAILURES = new Set([FAILURE.TIMEOUT, FAILURE.BAD_CHECKSUM, FAILURE.ECHO_MISMATCH]);
 
 const hex = (bytes) => [...bytes].map((b) => b.toString(16).padStart(2, '0')).join(' ');
-const sum = (bytes) => bytes.reduce((a, b) => (a + b) & 0xff, 0);
+/** The frame checksum of both styles: the sum of all bytes, mod 256. */
+const checksum = (bytes) => bytes.reduce((a, b) => (a + b) & 0xff, 0);
+
+/**
+ * One KWP2000 request frame with address bytes: `fmt target source data checksum`, `fmt` being the
+ * 0x80 / 0xC0 base the data length is OR-ed into; data over 63 bytes gets a separate length byte.
+ * The session builds every addressed request with it, and the probe kit builds its raw ones with it.
+ */
+function addressedFrame(fmt, target, source, data) {
+  const frame = data.length <= 63
+    ? [fmt | data.length, target, source, ...data]
+    : [fmt, target, source, data.length, ...data];
+  frame.push(checksum(frame));
+  return frame;
+}
 
 class KwpError extends Error {
   constructor(kind, message) {
@@ -60,6 +74,122 @@ class KwpNegativeResponse extends KwpError {
     super(FAILURE.NEGATIVE_RESPONSE, `negative response to service 0x${service.toString(16)}: code 0x${code.toString(16)}`);
     this.service = service;
     this.code = code;
+  }
+}
+
+/**
+ * Who gets the line next. Every request belongs to one class; pass
+ * `{ priority }` to request(), or the older `{ background: true }`.
+ *   NORMAL      the default: served first, in the order asked
+ *   BACKGROUND  reads nobody is watching move (the switch watcher's): served
+ *               behind NORMAL ones, unless it has already waited the session's
+ *               background wait (see KwpSession.setBackgroundWaitMs)
+ */
+const PRIORITY = Object.freeze({ NORMAL: 'normal', BACKGROUND: 'background' });
+
+const DEFAULT_BACKGROUND_WAIT_MS = 300;
+
+/**
+ * The line lock behind KwpSession: one request on the K-line at a time, and
+ * an optional hold that keeps everyone else off it.
+ *
+ * Interface: `acquire(priority)` resolves a release function (call it once,
+ * further calls do nothing); `hold()` returns { acquire, release }; `busy`.
+ * Ordering when the line comes free: the oldest BACKGROUND request that has
+ * waited at least `backgroundWaitMs`, else the oldest NORMAL one, else the
+ * oldest. The line passes straight to the next request, never through "free",
+ * so a late arrival cannot cut in. The caller releases after every request,
+ * failed or not (KwpSession.request does it in a `finally`).
+ *
+ * A hold admits only requests made through its own `acquire`; every other
+ * acquire() made while it is in place waits, and goes on after it is released.
+ * Requests that were already queued or running when hold() was called are not
+ * affected: they finish first, which is what lets the holder's first request
+ * wait for its turn like any other. On release the parked requests take their
+ * turn by the ordering above, as if they had just been queued, so a NORMAL one
+ * asked later still beats a BACKGROUND one asked earlier. One hold at a time.
+ */
+class LineLock {
+  constructor(clock, backgroundWaitMs = DEFAULT_BACKGROUND_WAIT_MS) {
+    this.clock = clock;
+    this.backgroundWaitMs = backgroundWaitMs;
+    this._taken = false; // a request has the line
+    this._waiters = []; // { resolve, priority, since } for the requests waiting their turn
+    this._parked = []; // the same, for requests kept off the line by a hold
+    this._pending = 0; // requests running or waiting, parked or queued
+    this._holding = null; // the hold in place, if any
+    this._deferring = false; // a background request is waiting one turn of the event loop for an ordinary one to arrive
+  }
+
+  /** True while a request is running or waiting. */
+  get busy() {
+    return this._pending > 0;
+  }
+
+  async acquire(priority = PRIORITY.NORMAL, hold = null) {
+    this._pending++;
+    const entry = (resolve) => ({ resolve, priority, since: this.clock.now() });
+    if (this._holding && this._holding !== hold) await new Promise((resolve) => this._parked.push(entry(resolve)));
+    else if (this._taken) await new Promise((resolve) => this._waiters.push(entry(resolve)));
+    else this._taken = true;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this._pending--;
+      this._handOver();
+    };
+  }
+
+  hold() {
+    if (this._holding) throw new Error('the line is already held');
+    const hold = {};
+    this._holding = hold;
+    return {
+      acquire: (priority) => this.acquire(priority, hold),
+      release: () => {
+        if (this._holding !== hold) return;
+        this._holding = null;
+        // The parked requests join the queue in the order they asked and the usual rules pick among them.
+        this._waiters.push(...this._parked.splice(0));
+        if (!this._taken && this._waiters.length) {
+          this._taken = true;
+          this._handOver();
+        }
+      },
+    };
+  }
+
+  /** The line is free: pick who goes next. `settled` is true once the one-turn wait for an ordinary request is over. */
+  _handOver(settled = false) {
+    const now = this.clock.now();
+    let i = this._waiters.findIndex((w) => w.priority === PRIORITY.BACKGROUND && now - w.since >= this.backgroundWaitMs);
+    if (i < 0) i = this._waiters.findIndex((w) => w.priority !== PRIORITY.BACKGROUND);
+    if (i < 0 && this._waiters.length && settled) i = 0;
+    if (i < 0 && this._waiters.length) {
+      // Only background requests wait, none of them for long. The caller that just released the line is
+      // usually about to ask for its next read (the dashboard asks back to back): the line is left free for
+      // one turn of the event loop so that request can take it, and only then does the oldest background
+      // one go. Without this the line is handed to the background request before the next ordinary one is
+      // even queued, and the two take turns one for one.
+      this._taken = false;
+      if (!this._deferring) {
+        this._deferring = true;
+        setImmediate(() => {
+          this._deferring = false;
+          if (!this._taken && this._waiters.length) {
+            this._taken = true;
+            this._handOver(true);
+          }
+        });
+      }
+      return;
+    }
+    if (i < 0) {
+      this._taken = false;
+      return;
+    }
+    this._waiters.splice(i, 1)[0].resolve(); // the line stays taken, handed to that request
   }
 }
 
@@ -107,18 +237,49 @@ class KwpSession {
     // by any reply. The connection watches this to notice a dead ECU.
     this.linkFailures = 0;
     this.lastLinkFailure = null;
-    this._held = false; // a request holds the line
-    this._waiters = []; // { resolve, background, since } for the requests waiting their turn
-    this._waiting = 0;
-    // A background request (the switch watcher's) waits behind the others, unless it has waited this long:
-    // then it goes next, so the live gauges get most of the line but the background reads still advance.
-    this.backgroundAgeMs = 300;
+    this._line = new LineLock(clock);
     this._queued = []; // reply frames already read but not yet handed out
   }
 
-  /** True while a request is running or queued. */
+  /** True while a request is running or queued (or waiting out a hold). */
   get busy() {
-    return this._waiting > 0;
+    return this._line.busy;
+  }
+
+  /**
+   * How long a BACKGROUND request waits behind NORMAL ones before it goes
+   * next regardless (default 300 ms): the live gauges get most of the line,
+   * the background reads still advance. 0 = no waiting at all, Infinity =
+   * background requests only run when no NORMAL one is queued. Takes effect
+   * for the next time the line comes free.
+   */
+  setBackgroundWaitMs(ms) {
+    if (typeof ms !== 'number' || Number.isNaN(ms) || ms < 0) throw new TypeError('background wait must be a number of milliseconds, 0 or more');
+    this._line.backgroundWaitMs = ms;
+  }
+
+  /** The background wait in ms (see setBackgroundWaitMs). Also readable and writable as `backgroundAgeMs`, its old name. */
+  get backgroundAgeMs() {
+    return this._line.backgroundWaitMs;
+  }
+
+  set backgroundAgeMs(ms) {
+    this.setBackgroundWaitMs(ms);
+  }
+
+  /**
+   * Keep every other request off the line until `release()`, for an exchange
+   * that must not be interleaved (the security access seed and key). Returns
+   * `{ request, release }`: `request(data, opts)` is request() for the holder
+   * and is not held back; `release()` lets the rest go, in their usual order,
+   * and may be called more than once. Requests already queued or running when
+   * this is called go first, the holder's own queue behind them. Call release
+   * in a `finally`: a holder that never releases starves the session. Only
+   * one hold at a time (a second hold() throws).
+   */
+  hold() {
+    const h = this._line.hold();
+    return { request: (data, opts) => this._send(data, opts, h.acquire), release: h.release };
   }
 
   log(...args) {
@@ -126,15 +287,8 @@ class KwpSession {
   }
 
   _buildFrame(data) {
-    if (this.style === 'iso9141') return [...ISO_REQUEST_HEADER, ...data, sum([...ISO_REQUEST_HEADER, ...data])];
-    let frame;
-    if (data.length <= 63) {
-      frame = [this.fmtBase | data.length, this.target, this.source, ...data];
-    } else {
-      frame = [this.fmtBase, this.target, this.source, data.length, ...data];
-    }
-    frame.push(frame.reduce((a, b) => (a + b) & 0xff, 0));
-    return frame;
+    if (this.style === 'iso9141') return [...ISO_REQUEST_HEADER, ...data, checksum([...ISO_REQUEST_HEADER, ...data])];
+    return addressedFrame(this.fmtBase, this.target, this.source, data);
   }
 
   /** Read and discard the echo of what we just transmitted (K-line loopback). */
@@ -192,7 +346,7 @@ class KwpSession {
     const cs = await this.t.readByte(60);
     if (cs === null) throw truncated();
 
-    const expected = sum([...header, ...data]);
+    const expected = checksum([...header, ...data]);
     if (expected !== cs) {
       const msg = `checksum mismatch: frame=[${hex([...header, ...data, cs])}] expected=${expected.toString(16)}`;
       this.log(msg);
@@ -227,7 +381,7 @@ class KwpSession {
       let end = -1;
       for (let e = start + ISO_REPLY_HEADER.length + 2; e <= bytes.length; e++) {
         if (e < bytes.length && !startsReply(e)) continue;
-        if (sum(bytes.slice(start, e - 1)) === bytes[e - 1]) {
+        if (checksum(bytes.slice(start, e - 1)) === bytes[e - 1]) {
           end = e;
           break;
         }
@@ -246,29 +400,6 @@ class KwpSession {
     if (this.style !== 'iso9141') return this._readFrame(timeoutMs);
     this._queued.push(...(await this._readBurst(timeoutMs)));
     return this._queued.shift();
-  }
-
-  async _lock(background = false) {
-    this._waiting++;
-    if (this._held) await new Promise((resolve) => this._waiters.push({ resolve, background, since: this.clock.now() }));
-    else this._held = true;
-    return () => {
-      this._waiting--;
-      this._handOver();
-    };
-  }
-
-  /** The line is free: the next request is the oldest background one that has waited long enough, else the oldest ordinary one, else the oldest. */
-  _handOver() {
-    const now = this.clock.now();
-    let i = this._waiters.findIndex((w) => w.background && now - w.since >= this.backgroundAgeMs);
-    if (i < 0) i = this._waiters.findIndex((w) => !w.background);
-    if (i < 0 && this._waiters.length) i = 0;
-    if (i < 0) {
-      this._held = false;
-      return;
-    }
-    this._waiters.splice(i, 1)[0].resolve(); // the line stays held, handed to that request
   }
 
   async _exchange(data, { timeout, multiFrame }) {
@@ -353,14 +484,26 @@ class KwpSession {
    *   allowSilence the caller treats "no reply at all" as an answer (an
    *                unsupported mode): the timeout is still thrown, but does
    *                not count in linkFailures
-   *   background   wait behind other requests (see backgroundAgeMs); for reads nobody is watching move
+   *   priority     PRIORITY.NORMAL (default) or PRIORITY.BACKGROUND: who gets
+   *                the line first when several requests wait (see PRIORITY)
+   *   background   shorthand for priority: PRIORITY.BACKGROUND; for reads
+   *                nobody is watching move
+   *
+   * Requests are served one at a time, normal ones first in the order asked;
+   * the line is released after every request, whether it succeeded or threw.
+   * While a hold() is in place a request made outside it waits for the release.
    *
    * Throws KwpError with a `.kind` from FAILURE; KwpNegativeResponse (also a
    * KwpError) adds `.service` and `.code`. Negative responses are never retried.
    */
-  async request(data, { timeout = this.defaultTimeout, retries = 1, destructive = false, multiFrame = false, allowSilence = false, background = false } = {}) {
+  request(data, opts) {
+    return this._send(data, opts, (priority) => this._line.acquire(priority));
+  }
+
+  /** request() taking the line with `acquire(priority)`: the lock's own, or a hold's. */
+  async _send(data, { timeout = this.defaultTimeout, retries = 1, destructive = false, multiFrame = false, allowSilence = false, background = false, priority = PRIORITY.NORMAL } = {}, acquire) {
     const maxRetries = destructive ? 0 : retries;
-    const release = await this._lock(background);
+    const release = await acquire(background ? PRIORITY.BACKGROUND : priority);
     try {
       for (let attempt = 0; ; attempt++) {
         try {
@@ -407,4 +550,4 @@ class KwpSession {
   }
 }
 
-module.exports = { KwpSession, KwpError, KwpNegativeResponse, FAILURE, SVC, STYLES, hex };
+module.exports = { KwpSession, KwpError, KwpNegativeResponse, FAILURE, PRIORITY, SVC, STYLES, hex, checksum, addressedFrame };

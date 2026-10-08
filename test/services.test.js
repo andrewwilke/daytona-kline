@@ -3,6 +3,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
 const svc = require('../src/services');
+const outputtests = require('../src/outputtests');
 const { DEFAULT_BIKE: bike } = require('../src/bikes');
 const { awakeSession } = require('./helpers');
 const { unlockSession } = require('../src/unlock');
@@ -358,12 +359,66 @@ test('the unlock gate reads the connection\'s own state and never guesses from a
 });
 
 test('lockedGauges names the unlock-only gauges until the connection is unlocked', () => {
-  const state = (unlockState) => ({ unlockState, bike });
+  const state = (unlockState) => ({ style: 'iso9141', unlockState, bike });
   assert.deepEqual(svc.lockedGauges(state('locked')), ['battery', 'gear']);
   assert.deepEqual(svc.lockedGauges(state('unavailable')), ['battery', 'gear'], 'also on a connection that cannot unlock');
   assert.deepEqual(svc.lockedGauges(state('unlocking')), ['battery', 'gear']);
   assert.deepEqual(svc.lockedGauges(state('unlocked')), []);
   assert.deepEqual(svc.lockedGauges(state('locked'), bike.gauges.filter((g) => g.key === 'rpm')), []);
+  assert.deepEqual(svc.lockedGauges({ style: null, unlockState: 'locked', bike }), ['battery', 'gear'], 'with no session the dials wait for the unlock too');
+});
+
+// One gate: needsUnlock says whether gated reads may go ahead; lockedGauges, requireUnlock and the output test
+// refusal (outputtests.unlockProblem) are derived from it, so they are asked about the same connection states here.
+test('lockedGauges, requireUnlock and the output test refusal agree with needsUnlock on every unlock state and session style', () => {
+  const states = [
+    ['unlocked', null],
+    ['locked', null],
+    ['unlocking', null],
+    ['failed', 'the ECU refused the key (code 0x35)'],
+    ['invalid', 'the unlock file x is not valid JSON'],
+    ['unavailable', 'no unlock file at x'],
+  ];
+  for (const style of ['iso9141', 'addressed', null]) {
+    for (const [unlockState, unlockReason] of states) {
+      const conn = { style, unlockState, unlockReason, bike };
+      const label = `${style} / ${unlockState}`;
+      const why = svc.needsUnlock(conn);
+      const open = why === null;
+      // With no session at all nothing is gated for reads (callers fail as "not connected" first), but the dials still wait for the unlock.
+      const gaugesOpen = style === null ? unlockState === 'unlocked' : open;
+      assert.deepEqual(svc.lockedGauges(conn), gaugesOpen ? [] : ['battery', 'gear'], `lockedGauges: ${label}`);
+      if (open) svc.requireUnlock(conn);
+      else assert.throws(() => svc.requireUnlock(conn), (e) => e instanceof svc.NeedsUnlockError && e.message === why, `requireUnlock: ${label}`);
+      // The output test refusal is the gate asked strictly: never more permissive than the reads' gate, and it
+      // differs only where reads are not gated at all (a session that is not ISO 9141).
+      const problem = outputtests.unlockProblem(conn);
+      assert.equal(problem, svc.needsUnlock(conn, { strict: true }), `unlockProblem: ${label}`);
+      assert.equal(problem === null, unlockState === 'unlocked', `an output test needs the actual unlock: ${label}`);
+      if (why) assert.equal(problem, why, `a closed gate gives the same words to an output test: ${label}`);
+    }
+  }
+});
+
+test('the gate on a session that is not ISO 9141: reads are not gated, an output test still needs the unlock and says why', () => {
+  const addressed = { style: 'addressed', unlockState: 'unavailable', unlockReason: 'unlock is only for ISO 9141 sessions (this one is addressed)', bike };
+  assert.equal(svc.needsUnlock(addressed), null);
+  assert.deepEqual(svc.lockedGauges(addressed), []);
+  svc.requireUnlock(addressed);
+  assert.equal(outputtests.unlockProblem(addressed), 'needs the ECU unlock, not available (unlock is only for ISO 9141 sessions (this one is addressed))');
+});
+
+test('the gate when the unlock is unavailable or invalid on an ISO session: every derived check refuses, in the same words', () => {
+  for (const conn of [
+    { style: 'iso9141', unlockState: 'unavailable', unlockReason: 'no unlock file at x', bike },
+    { style: 'iso9141', unlockState: 'invalid', unlockReason: 'the unlock file x is not valid JSON', bike },
+  ]) {
+    const why = svc.needsUnlock(conn);
+    assert.match(why, /^needs the ECU unlock, not available \(.+\)$/);
+    assert.deepEqual(svc.lockedGauges(conn), ['battery', 'gear']);
+    assert.throws(() => svc.requireUnlock(conn), (e) => e.message === why);
+    assert.equal(outputtests.unlockProblem(conn), why);
+  }
 });
 
 test('id gauges decode the big-endian reply: scaled, offset, stepped, or the highest set bit', () => {
@@ -477,4 +532,25 @@ test('the recorder id read resends once on silence: readIdBytes with retries 1',
   assert.deepEqual(await svc.readIdBytes(session, 0x42, { retries: 1 }), [0x00, 0xff]);
   t.inject('dropReply', { service: 0x22 });
   assert.equal(await svc.readIdBytes(session, 0x42), null, 'without retries one silence is "not served"');
+});
+
+test('probeCommonId sorts an id into hit, refused or silent with one request each, and a silent id is no link failure', async () => {
+  const { t, session } = await unlockedIso();
+  t.silentIds.add(0x42);
+  const before = t.requests.length;
+  const hit = await svc.probeCommonId(session, 0x41);
+  assert.deepEqual([hit.hit.id, hit.why, hit.hit.hex], [0x41, null, hit.hit.hex]);
+  assert.equal(hit.hit.value, hit.hit.bytes.reduce((a, b) => a * 256 + b, 0));
+  assert.deepEqual(await svc.probeCommonId(session, 0x43), { hit: null, why: 'refused' });
+  assert.deepEqual(await svc.probeCommonId(session, 0x42), { hit: null, why: 'silent' });
+  assert.deepEqual(t.requests.slice(before).map((r) => r.data), [[0x22, 0x00, 0x41], [0x22, 0x00, 0x43], [0x22, 0x00, 0x42]], 'one request per id, never resent');
+  assert.equal(session.linkFailures, 0);
+});
+
+test('the id gauge read treats a refusal as not served but silence as a failing link, unlike the tolerant reads', async () => {
+  const { t, session } = await unlockedIso();
+  const gear = bike.gauges.find((g) => g.key === 'gear');
+  t.silentIds.add(0x21);
+  await assert.rejects(() => svc.readGauge(session, gear), /no response/);
+  assert.equal(await svc.readIdBytes(session, 0x21), null, 'the same silence is "not served" to readIdBytes');
 });
